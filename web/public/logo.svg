@@ -1,0 +1,10 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- 圆形背景 -->
+  <circle cx="16" cy="16" r="15" fill="#1570EF"/>
+  <!-- 白色十字 -->
+  <rect x="12" y="7" width="8" height="18" rx="2" fill="white"/>
+  <rect x="7" y="12" width="18" height="8" rx="2" fill="white"/>
+  <!-- 蓝色脉搏线（叠在十字中心） -->
+  <polyline points="7,16 10,16 12,11 14,21 16,14 18,18 20,16 25,16"
+            stroke="#1570EF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

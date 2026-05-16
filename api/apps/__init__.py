@@ -1,0 +1,322 @@
+
+import logging
+import os
+import sys
+import time
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+from quart import Blueprint, Quart, request, g, current_app, session, jsonify
+from itsdangerous.url_safe import URLSafeTimedSerializer as Serializer
+from quart_cors import cors
+from common.constants import StatusEnum, RetCode
+from api.db.db_models import close_connection, APIToken
+from api.db.services import UserService
+from api.utils.json_encode import CustomJSONEncoder
+from api.utils import commands
+
+from quart_auth import Unauthorized as QuartAuthUnauthorized
+from werkzeug.exceptions import Unauthorized as WerkzeugUnauthorized
+from quart_schema import QuartSchema
+from common import settings
+from api.utils.api_utils import server_error_response, get_json_result
+from api.constants import API_VERSION
+from common.misc_utils import get_uuid
+
+settings.init_settings()
+
+__all__ = ["app"]
+
+UNAUTHORIZED_MESSAGE = "<Unauthorized '401: Unauthorized'>"
+
+
+def _unauthorized_message(error):
+    if error is None:
+        return UNAUTHORIZED_MESSAGE
+
+    description = getattr(error, "description", None)
+    if description:
+        return description
+
+    try:
+        return repr(error)
+    except Exception:
+        return UNAUTHORIZED_MESSAGE
+
+app = Quart(__name__)
+app = cors(app, allow_origin="*")
+
+# openapi supported
+QuartSchema(app)
+
+app.url_map.strict_slashes = False
+app.json_encoder = CustomJSONEncoder
+app.errorhandler(Exception)(server_error_response)
+
+# Configure Quart timeouts for slow LLM responses (e.g., local Ollama on CPU)
+# Default Quart timeouts are 60 seconds which is too short for many LLM backends
+app.config["RESPONSE_TIMEOUT"] = int(os.environ.get("QUART_RESPONSE_TIMEOUT", 600))
+app.config["BODY_TIMEOUT"] = int(os.environ.get("QUART_BODY_TIMEOUT", 600))
+
+## convince for dev and debug
+# app.config["LOGIN_DISABLED"] = True
+app.config["SESSION_PERMANENT"] = False
+app.config["SESSION_TYPE"] = "redis"
+app.config["SESSION_REDIS"] = settings.decrypt_database_config(name="redis")
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("MAX_CONTENT_LENGTH", 1024 * 1024 * 1024)
+)
+app.config['SECRET_KEY'] = settings.SECRET_KEY
+app.secret_key = settings.SECRET_KEY
+commands.register_commands(app)
+
+from functools import wraps
+from typing import ParamSpec, TypeVar
+from collections.abc import Awaitable, Callable
+from werkzeug.local import LocalProxy
+
+T = TypeVar("T")
+P = ParamSpec("P")
+
+
+def _load_user():
+    jwt = Serializer(secret_key=settings.SECRET_KEY)
+    authorization = request.headers.get("Authorization")
+    g.user = None
+    if not authorization:
+        return None
+
+    try:
+        # JWT encodes user ID — look up by id, not access_token
+        user_id = str(jwt.loads(authorization))
+        if user_id and len(user_id) >= 32:
+            user = UserService.query(id=user_id, status=StatusEnum.VALID.value)
+            if user:
+                g.user = user[0]
+                return user[0]
+    except Exception as e_auth:
+        logging.warning(f"load_user from jwt got exception {e_auth}")
+        # Fallback: "Bearer <access_token>" or raw access_token (for API clients)
+        try:
+            parts = authorization.split()
+            token = parts[1] if len(parts) == 2 else (parts[0] if len(parts) == 1 else "")
+            if token and len(token) >= 32:
+                user = UserService.query(access_token=token, status=StatusEnum.VALID.value)
+                if user:
+                    g.user = user[0]
+                    return user[0]
+        except Exception as e_fallback:
+            logging.warning(f"load_user token fallback got exception {e_fallback}")
+
+
+current_user = LocalProxy(_load_user)
+
+
+def login_required(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+    """A decorator to restrict route access to authenticated users.
+
+    This should be used to wrap a route handler (or view function) to
+    enforce that only authenticated requests can access it. Note that
+    it is important that this decorator be wrapped by the route
+    decorator and not vice, versa, as below.
+
+    .. code-block:: python
+
+        @app.route('/')
+        @login_required
+        async def index():
+            ...
+
+    If the request is not authenticated a
+    `quart.exceptions.Unauthorized` exception will be raised.
+
+    """
+
+    @wraps(func)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        timing_enabled = os.getenv("RAG-MedQA_API_TIMING")
+        t_start = time.perf_counter() if timing_enabled else None
+        user = current_user
+        if timing_enabled:
+            logging.info(
+                "api_timing login_required auth_ms=%.2f path=%s",
+                (time.perf_counter() - t_start) * 1000,
+                request.path,
+            )
+        if not user:  # or not session.get("_user_id"):
+            raise QuartAuthUnauthorized()
+        return await current_app.ensure_async(func)(*args, **kwargs)
+
+    return wrapper
+
+
+def login_user(user, remember=False, duration=None, force=False, fresh=True):
+    """
+    Logs a user in. You should pass the actual user object to this. If the
+    user's `is_active` property is ``False``, they will not be logged in
+    unless `force` is ``True``.
+
+    This will return ``True`` if the login attempt succeeds, and ``False`` if
+    it fails (i.e. because the user is inactive).
+
+    :param user: The user object to log in.
+    :type user: object
+    :param remember: Whether to remember the user after their session expires.
+        Defaults to ``False``.
+    :type remember: bool
+    :param duration: The amount of time before the remember cookie expires. If
+        ``None`` the value set in the settings is used. Defaults to ``None``.
+    :type duration: :class:`datetime.timedelta`
+    :param force: If the user is inactive, setting this to ``True`` will log
+        them in regardless. Defaults to ``False``.
+    :type force: bool
+    :param fresh: setting this to ``False`` will log in the user with a session
+        marked as not "fresh". Defaults to ``True``.
+    :type fresh: bool
+    """
+    if not force and not user.is_active:
+        return False
+
+    session["_user_id"] = user.id
+    session["_fresh"] = fresh
+    session["_id"] = get_uuid()
+    return True
+
+
+def logout_user():
+    """
+    Logs a user out. (You do not need to pass the actual user.) This will
+    also clean up the remember me cookie if it exists.
+    """
+    if "_user_id" in session:
+        session.pop("_user_id")
+
+    if "_fresh" in session:
+        session.pop("_fresh")
+
+    if "_id" in session:
+        session.pop("_id")
+
+    COOKIE_NAME = "remember_token"
+    cookie_name = current_app.config.get("REMEMBER_COOKIE_NAME", COOKIE_NAME)
+    if cookie_name in request.cookies:
+        session["_remember"] = "clear"
+        if "_remember_seconds" in session:
+            session.pop("_remember_seconds")
+
+    return True
+
+
+def search_pages_path(page_path):
+    app_path_list = [
+        path for path in page_path.glob("*_app.py") if not path.name.startswith(".")
+    ]
+    api_path_list = [
+        path for path in page_path.glob("*sdk/*.py") if not path.name.startswith(".")
+    ]
+    app_path_list.extend(api_path_list)
+    restful_api_path_list = [
+        path for path in page_path.glob("*restful_apis/*.py") if not path.name.startswith(".")
+    ]
+    app_path_list.extend(restful_api_path_list)
+    return app_path_list
+
+
+def register_page(page_path):
+    path = f"{page_path}"
+
+    page_name = page_path.stem.removesuffix("_app")
+    module_name = ".".join(
+        page_path.parts[page_path.parts.index("api"): -1] + (page_name,)
+    )
+
+    spec = spec_from_file_location(module_name, page_path)
+    page = module_from_spec(spec)
+    page.app = app
+    page.manager = Blueprint(page_name, module_name)
+    sys.modules[module_name] = page
+    spec.loader.exec_module(page)
+    page_name = getattr(page, "page_name", page_name)
+    sdk_path = "\\sdk\\" if sys.platform.startswith("win") else "/sdk/"
+    restful_api_path = "\\restful_apis\\" if sys.platform.startswith("win") else "/restful_apis/"
+    url_prefix = (
+        f"/api/{API_VERSION}" if sdk_path in path or restful_api_path in path else f"/{API_VERSION}/{page_name}"
+    )
+
+    app.register_blueprint(page.manager, url_prefix=url_prefix)
+    return url_prefix
+
+
+pages_dir = [
+    Path(__file__).parent,
+    Path(__file__).parent.parent / "api" / "apps",
+    Path(__file__).parent.parent / "api" / "apps" / "restful_apis",
+    Path(__file__).parent.parent / "api" / "apps" / "sdk",
+]
+
+client_urls_prefix = [
+    register_page(path) for directory in pages_dir for path in search_pages_path(directory)
+]
+
+
+# ── SPA 静态文件托管（生产环境） ──────────────────────────────────────────────
+from quart import send_from_directory
+
+DIST = Path(__file__).parent.parent / "web" / "dist"
+_API_PREFIXES = ("/api/", "/v1/")
+
+
+def _is_api_path(path: str) -> bool:
+    return any(path.startswith(p) for p in _API_PREFIXES)
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+async def serve_spa(path: str):
+    if _is_api_path(f"/{path}") or _is_api_path(request.path):
+        return jsonify({
+            "code": RetCode.NOT_FOUND,
+            "message": f"Not Found: {request.path}",
+            "data": None,
+            "error": "Not Found",
+        }), RetCode.NOT_FOUND
+    full = DIST / path
+    if full.is_file():
+        return await send_from_directory(str(DIST), path)
+    return await send_from_directory(str(DIST), "index.html")
+
+
+@app.errorhandler(404)
+async def not_found(error):
+    logging.error(f"The requested URL {request.path} was not found")
+    message = f"Not Found: {request.path}"
+    response = {
+        "code": RetCode.NOT_FOUND,
+        "message": message,
+        "data": None,
+        "error": "Not Found",
+    }
+    return jsonify(response), RetCode.NOT_FOUND
+
+
+@app.errorhandler(401)
+async def unauthorized(error):
+    logging.warning("Unauthorized request")
+    return get_json_result(code=RetCode.UNAUTHORIZED, message=_unauthorized_message(error)), RetCode.UNAUTHORIZED
+
+
+@app.errorhandler(QuartAuthUnauthorized)
+async def unauthorized_quart_auth(error):
+    logging.warning("Unauthorized request (quart_auth)")
+    return get_json_result(code=RetCode.UNAUTHORIZED, message=repr(error)), RetCode.UNAUTHORIZED
+
+
+@app.errorhandler(WerkzeugUnauthorized)
+async def unauthorized_werkzeug(error):
+    logging.warning("Unauthorized request (werkzeug)")
+    return get_json_result(code=error.code, message=error.description), RetCode.UNAUTHORIZED
+
+@app.teardown_request
+def _db_close(exception):
+    if exception:
+        logging.exception(f"Request failed: {exception}")
+    close_connection()
