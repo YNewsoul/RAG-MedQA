@@ -1,5 +1,14 @@
+"""模型注册与工厂映射入口。
 
-#  AFTER UPDATING THIS FILE, PLEASE ENSURE THAT docs/references/supported_models.mdx IS ALSO UPDATED for consistency!
+这个文件负责：
+1. 定义 LiteLLM 支持的提供商枚举。
+2. 维护默认 `base_url` 和 provider 前缀映射。
+3. 动态扫描 `chat_model / embedding_model / rerank_model ...` 中的工厂类，
+   生成统一的模型注册表。
+"""
+
+# 更新本文件后，也要同步更新 `docs/references/supported_models.mdx`，
+# 保持文档与代码中的模型列表一致。
 #
 
 import importlib
@@ -137,6 +146,7 @@ MODULE_MAPPING = {
 package_name = __name__
 
 for module_name, mapping_dict in MODULE_MAPPING.items():
+    # 动态导入各类模型模块，并收集其中声明了 `_FACTORY_NAME` 的实现类。
     full_module_name = f"{package_name}.{module_name}"
     module = importlib.import_module(full_module_name)
 

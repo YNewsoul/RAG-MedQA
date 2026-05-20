@@ -393,7 +393,7 @@ def get_parser_config(chunk_method, parser_config):
     if not chunk_method:
         chunk_method = "naive"
 
-    # Define default configurations for each chunking method
+    # 为不同切块/解析策略准备默认配置，后续再与用户传入配置合并。
     base_defaults = {
         "table_context_size": 0,
         "image_context_size": 0,
@@ -454,21 +454,21 @@ def get_parser_config(chunk_method, parser_config):
 
     default_config = key_mapping[chunk_method]
 
-    # If no parser_config provided, return default merged with base defaults
+    # 没传 parser_config 时，直接返回“基础默认值 + 策略默认值”。
     if not parser_config:
         if default_config is None:
             merged_config = deep_merge(base_defaults, {})
         else:
             merged_config = deep_merge(base_defaults, default_config)
     elif default_config is None:
-        # If parser_config is provided but no defaults for this method
+        # 某些策略没有预设模板，这时只和基础默认值合并。
         merged_config = deep_merge(base_defaults, parser_config)
     else:
-        # Ensure raptor and graph_rag fields have default values if not provided
+        # 先铺策略默认值，再让用户自定义配置覆盖。
         merged_config = deep_merge(base_defaults, default_config)
         merged_config = deep_merge(merged_config, parser_config)
 
-    # Flatten parent_child config into children_delimiter for the execution layer
+    # 执行层最终只关心 children_delimiter，这里把 parent_child 配置拍平。
     pc = merged_config.get("parent_child", {})
     if pc.get("use_parent_child"):
         merged_config["children_delimiter"] = pc.get("children_delimiter", "\n")

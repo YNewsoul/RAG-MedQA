@@ -1,3 +1,8 @@
+"""模型服务层。
+
+这里把聊天、向量、重排、识图、转写等不同模型统一包成 `LLMBundle`，
+业务层只需要面向统一接口编程即可。
+"""
 
 import asyncio
 import inspect
@@ -21,6 +26,7 @@ class LLMService(CommonService):
 
 
 def get_init_tenant_llm(user_id):
+    """根据系统默认配置，为用户生成初始可用模型列表。"""
     from common import settings
 
     tenant_llm = []
@@ -74,12 +80,14 @@ class LLMBundle(LLM4Tenant):
         super().__init__(model_config, lang, **kwargs)
 
     def bind_tools(self, toolcall_session, tools):
+        """给支持工具调用的聊天模型绑定工具集。"""
         if not self.is_tools:
             logging.warning(f"Model {self.model_config['llm_name']} does not support tool call, but you have assigned one or more tools to it!")
             return
         self.mdl.bind_tools(toolcall_session, tools)
 
     def encode(self, texts: list):
+        """统一向量编码入口，并负责 token 用量统计。"""
         if self.langfuse:
             generation = self.langfuse.start_generation(trace_context=self.trace_context, name="encode", model=self.model_config["llm_name"], input={"texts": texts})
 
@@ -105,6 +113,7 @@ class LLMBundle(LLM4Tenant):
         return embeddings, used_tokens
 
     def encode_queries(self, query: str):
+        """查询向量编码入口，通常用于用户问题检索。"""
         if self.langfuse:
             generation = self.langfuse.start_generation(trace_context=self.trace_context, name="encode_queries", model=self.model_config["llm_name"], input={"query": query})
 
@@ -121,6 +130,7 @@ class LLMBundle(LLM4Tenant):
         return emd, used_tokens
 
     def similarity(self, query: str, texts: list):
+        """统一重排/相似度计算入口。"""
         if self.langfuse:
             generation = self.langfuse.start_generation(trace_context=self.trace_context, name="similarity", model=self.model_config["llm_name"], input={"query": query, "texts": texts})
 
@@ -135,6 +145,7 @@ class LLMBundle(LLM4Tenant):
         return sim, used_tokens
 
     def describe(self, image, max_tokens=300):
+        """统一图片理解入口。"""
         if self.langfuse:
             generation = self.langfuse.start_generation(trace_context=self.trace_context, name="describe", metadata={"model": self.model_config["llm_name"]})
 

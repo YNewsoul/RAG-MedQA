@@ -1,3 +1,16 @@
+"""问答型知识库切块器。
+
+这个文件把 Excel、CSV/TXT、JSON、Markdown、Docx、PDF 中的问答对
+转换成统一 chunk 结构，是医疗 QA 知识库建库时的重要入口。
+
+支持的格式：
+- Excel（.xlsx/.xls）：默认前两列分别是问题和答案
+- CSV/TXT：UTF-8，TAB 或逗号分隔，两列问答
+- JSON/JSONL：支持 {"question": ..., "answer": ...} 或 {"q": ..., "a": ...}
+- PDF/Markdown/Docx：基于标题、列表或问答结构提取
+
+每一组问答对都会被视为一个原子 chunk。
+"""
 
 #
 
@@ -19,11 +32,24 @@ from common.float_utils import get_float
 
 
 class Excel:
+    """Excel 文件问答对提取器。"""
     def __call__(self, fnm, binary=None, callback=None):
+        """从 Excel 中提取问答对，默认按前两列读取为问和答。
+        
+        Args:
+            fnm: 文件名
+            binary: 文件二进制内容（可选）
+            callback: 进度回调函数
+            
+        Returns:
+            list: 问答对列表 [(q1, a1), (q2, a2), ...]
+        """
         if not binary:
             wb = load_workbook(fnm)
         else:
             wb = load_workbook(BytesIO(binary))
+        
+        # 计算总行数用于进度计算
         total = 0
         for sheetname in wb.sheetnames:
             total += len(list(wb[sheetname].rows))
@@ -34,6 +60,7 @@ class Excel:
             rows = list(ws.rows)
             for i, r in enumerate(rows):
                 q, a = "", ""
+                # 前两列分别作为问题和答案
                 for cell in r:
                     if not cell.value:
                         continue
@@ -47,15 +74,16 @@ class Excel:
                     res.append((q, a))
                 else:
                     fails.append(str(i + 1))
+                # 每999条更新一次进度
                 if len(res) % 999 == 0:
-                    callback(len(res) *
-                             0.6 /
-                             total, ("Extract pairs: {}".format(len(res)) +
-                                     (f"{len(fails)} failure, line: %s..." %
-                                      (",".join(fails[:3])) if fails else "")))
+                    callback(len(res) * 0.6 / total, 
+                             f"Extract pairs: {len(res)}" + 
+                             (f" {len(fails)} failure, line: {",".join(fails[:3])}..." if fails else ""))
 
-        callback(0.6, ("Extract pairs: {}. ".format(len(res)) + (
-            f"{len(fails)} failure, line: %s..." % (",".join(fails[:3])) if fails else "")))
+        callback(0.6, f"Extract pairs: {len(res)}. " + 
+                 (f"{len(fails)} failure, line: {",".join(fails[:3])}..." if fails else ""))
+        
+        # 检测语言
         self.is_english = is_english(
             [rmPrefix(q) for q, _ in random_choices(res, k=30) if len(q) > 1])
         return res
@@ -63,51 +91,78 @@ class Excel:
 
 
 class Docx:
+    """Docx 文件问答对提取器。
+    
+    基于标题层级和正文内容抽取问答对，支持多级标题嵌套。
+    """
     def __init__(self):
         pass
 
     def __call__(self, filename, binary=None, from_page=0, to_page=100000, callback=None):
+        """从 Docx 的标题层级和正文内容中抽取问答对。
+        
+        Args:
+            filename: 文件名
+            binary: 文件二进制内容（可选）
+            from_page: 起始页码
+            to_page: 结束页码
+            callback: 进度回调函数
+            
+        Returns:
+            tuple: (问答对列表, 表格列表)
+        """
         from docx import Document
         self.doc = Document(
             filename) if not binary else Document(BytesIO(binary))
-        pn = 0
+        
+        pn = 0  # 当前页码
         last_answer, last_image = "", None
-        question_stack, level_stack = [], []
-        qai_list = []
+        question_stack, level_stack = [], []  # 问题栈和层级栈
+        qai_list = []  # 问答对列表
+        
         for p in self.doc.paragraphs:
             if pn > to_page:
                 break
             question_level, p_text = 0, ''
             if from_page <= pn < to_page and p.text.strip():
                 question_level, p_text = docx_question_level(p)
-            if not question_level or question_level > 6:  # not a question
+            
+            # 不是问题标题，视为答案正文
+            if not question_level or question_level > 6:
                 last_answer = f'{last_answer}\n{p_text}'
                 current_image = self.get_picture(self.doc, p)
                 last_image = concat_img(last_image, current_image)
-            else:  # is a question
+            else:
+                # 命中了问题标题层级，保存上一个问答对
                 if last_answer or last_image:
                     sum_question = '\n'.join(question_stack)
                     if sum_question:
                         qai_list.append((sum_question, last_answer, last_image))
                     last_answer, last_image = '', None
 
+                # 更新问题栈（处理嵌套标题）
                 i = question_level
                 while question_stack and i <= level_stack[-1]:
                     question_stack.pop()
                     level_stack.pop()
                 question_stack.append(p_text)
                 level_stack.append(question_level)
+            
+            # 检测分页
             for run in p.runs:
                 if 'lastRenderedPageBreak' in run._element.xml:
                     pn += 1
                     continue
                 if 'w:br' in run._element.xml and 'type="page"' in run._element.xml:
                     pn += 1
+        
+        # 处理最后一个问答对
         if last_answer:
             sum_question = '\n'.join(question_stack)
             if sum_question:
                 qai_list.append((sum_question, last_answer, last_image))
 
+        # 提取表格
         tbls = []
         for tb in self.doc.tables:
             html = "<table>"
@@ -126,16 +181,38 @@ class Docx:
                 html += "</tr>"
             html += "</table>"
             tbls.append(((None, html), ""))
+        
         return qai_list, tbls
 
 
 def rmPrefix(txt):
+    """移除文本开头的问答前缀（如"问题："、"Q:"等）。
+    
+    Args:
+        txt: 原始文本
+        
+    Returns:
+        str: 移除前缀后的文本
+    """
     return re.sub(
         r"^(问题|答案|回答|user|assistant|Q|A|Question|Answer|问|答)[\t:： ]+", "", txt.strip(), flags=re.IGNORECASE)
 
 
 
 def beAdocDocx(d, q, a, eng, image, row_num=-1):
+    """将问答对转换为带图片的chunk文档结构。
+    
+    Args:
+        d: 基础文档字典
+        q: 问题
+        a: 答案
+        eng: 是否为英文
+        image: 图片内容
+        row_num: 行号（用于排序）
+        
+    Returns:
+        dict: 完整的chunk文档
+    """
     qprefix = "Question: " if eng else "问题："
     aprefix = "Answer: " if eng else "回答："
     d["content_with_weight"] = "\t".join(
@@ -151,6 +228,18 @@ def beAdocDocx(d, q, a, eng, image, row_num=-1):
 
 
 def beAdoc(d, q, a, eng, row_num=-1):
+    """将问答对转换为chunk文档结构。
+    
+    Args:
+        d: 基础文档字典
+        q: 问题
+        a: 答案
+        eng: 是否为英文
+        row_num: 行号（用于排序）
+        
+    Returns:
+        dict: 完整的chunk文档
+    """
     qprefix = "Question: " if eng else "问题："
     aprefix = "Answer: " if eng else "回答："
     d["content_with_weight"] = "\t".join(
@@ -163,21 +252,40 @@ def beAdoc(d, q, a, eng, row_num=-1):
 
 
 def mdQuestionLevel(s):
+    """解析 Markdown 标题层级。
+    
+    Args:
+        s: Markdown 文本行
+        
+    Returns:
+        tuple: (标题级别, 标题文本)
+    """
     match = re.match(r'#*', s)
     return (len(match.group(0)), s.lstrip('#').lstrip()) if match else (0, s)
 
 
 def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", callback=None, **kwargs):
-    """
-        Supported formats:
-        - Excel (.xlsx/.xls): 2 columns, question then answer, no header
-        - CSV/TXT: UTF-8, TAB or comma delimiter, 2 columns
-        - JSON (.json): array of {"question":..., "answer":...} objects, or {"q":..., "a":...}
-        - JSONL (.jsonl): one JSON object per line, same field conventions as JSON
-        - PDF, Markdown, Docx: Q&A bullet/heading structure
+    """将各种格式的文档转换为问答型chunk。
+    
+    支持格式：
+    - Excel（.xlsx/.xls）：默认前两列分别是问题和答案，无表头要求
+    - CSV/TXT：UTF-8，TAB 或逗号分隔，两列问答
+    - JSON/JSONL：支持 {"question": ..., "answer": ...} 或 {"q": ..., "a": ...}
+    - PDF/Markdown/Docx：基于标题、列表或问答结构提取
 
-        Every Q&A pair is treated as one atomic chunk.
-        Malformed lines/records are skipped and reported.
+    每一组问答对都会被视为一个原子 chunk。
+    无法解析的行/记录会被跳过，并通过回调上报。
+    
+    Args:
+        filename: 文件名（用于判断格式）
+        binary: 文件二进制内容
+        from_page: 起始页码
+        to_page: 结束页码
+        lang: 语言（Chinese/English）
+        callback: 进度回调函数
+        
+    Returns:
+        list: chunk文档列表
     """
     eng = lang.lower() == "english"
     res = []
@@ -185,6 +293,8 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
         "docnm_kwd": filename,
         "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename))
     }
+    
+    # Excel格式处理
     if re.search(r"\.xlsx?$", filename, re.IGNORECASE):
         callback(0.1, "Start to parse.")
         excel_parser = Excel()
@@ -315,7 +425,7 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
         lines = txt.strip().splitlines() if re.search(r"\.jsonl$", filename, re.IGNORECASE) else None
 
         if lines is None:
-            # JSON array format
+        # JSON 数组格式。
             try:
                 records = json.loads(txt)
                 if isinstance(records, dict):
@@ -323,7 +433,7 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             except json.JSONDecodeError as ex:
                 raise ValueError(f"Invalid JSON file: {ex}")
         else:
-            # JSONL format — one record per line
+        # JSONL 格式：每行一条记录。
             records = []
             for line in lines:
                 line = line.strip()

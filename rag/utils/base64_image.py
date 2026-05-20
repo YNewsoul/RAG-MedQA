@@ -1,4 +1,9 @@
 
+"""图片与存储标识互转辅助。
+
+负责把内存中的图片对象上传到对象存储，并把图片 ID 回填到 chunk；
+也负责根据图片 ID 再反查回 PIL Image。
+"""
 
 import base64
 import logging
@@ -17,6 +22,7 @@ test_image = base64.b64decode(test_image_base64)
 
 
 async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str = "imagetemps"):
+    """把字典中的图片上传到对象存储，并回填 `img_id`。"""
     import logging
     from io import BytesIO
     from rag.svr.task_executor import minio_limiter
@@ -28,6 +34,7 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
         return
 
     def encode_image():
+        """把图片对象标准化编码成 JPEG 二进制。"""
         with BytesIO() as buf:
             img, close_after = open_image_for_processing(d["image"], allow_bytes=False)
 
@@ -80,6 +87,7 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
 
 
 def id2image(image_id: str | None, storage_get_func: partial):
+    """根据 `bucket-object` 形式的图片 ID 取回 PIL Image。"""
     if not image_id:
         return
     arr = image_id.split("-")

@@ -1,3 +1,8 @@
+"""Elasticsearch 检索与索引封装。
+
+负责把项目内部的查询表达式翻译成 ES DSL，并提供索引 CRUD、
+分页检索、向量检索和 rank feature 调整等能力。
+"""
 
 #
 
@@ -18,8 +23,8 @@ ATTEMPT_TIME = 2
 MAX_RESULT_WINDOW = 10000
 SEARCH_AFTER_BATCH_SIZE = 1000
 
-# Single-document atomic pagerank_fea adjust (chunk feedback). Clamps using params.min_w / max_w;
-# removes field at zero for rank_feature compatibility.
+# 单文档原子调整 `pagerank_fea`，用于 chunk 反馈分数修正。
+# 会按照 `min_w / max_w` 做截断；若归零则直接移除字段，便于 rank_feature 兼容。
 _PAGERANK_FEA_ADJUST_SCRIPT = """
 double cur = 0.0;
 if (ctx._source.containsKey(params.pf)) {
@@ -47,9 +52,7 @@ if (nw <= 0.0) {
 
 @singleton
 class ESConnection(ESConnectionBase):
-    """
-    CRUD operations
-    """
+    """ES 连接实现，提供查询、写入、更新、删除等核心操作。"""
 
     def _es_search_once(self, index_names: list[str], query: dict, track_total_hits: bool):
         return self.es.search(
@@ -139,8 +142,9 @@ class ESConnection(ESConnectionBase):
             agg_fields: list[str] | None = None,
             rank_feature: dict | None = None
     ):
-        """
-        Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl.html
+        """执行一次 ES 检索。
+
+        这里会把项目内部的全文/向量/融合查询表达式翻译成 ES DSL。
         """
         if isinstance(index_names, str):
             index_names = index_names.split(",")
@@ -168,6 +172,7 @@ class ESConnection(ESConnectionBase):
                     f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
 
         s = Search()
+        # 先从 FusionExpr 中提取“向量分数权重”，用于控制 must / knn 的组合方式。
         vector_similarity_weight = 0.5
         for m in match_expressions:
             if isinstance(m, FusionExpr) and m.method == "weighted_sum" and "weights" in m.fusion_params:
@@ -179,6 +184,7 @@ class ESConnection(ESConnectionBase):
                 vector_similarity_weight = get_float(weights.split(",")[1])
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
+                # 全文检索部分走 query_string。
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
                 if isinstance(minimum_should_match, float):
                     minimum_should_match = str(int(minimum_should_match * 100)) + "%"
@@ -189,6 +195,7 @@ class ESConnection(ESConnectionBase):
                 bool_query.boost = 1.0 - vector_similarity_weight
 
             elif isinstance(m, MatchDenseExpr):
+                # 向量检索部分走 knn 查询。
                 assert (bool_query is not None)
                 similarity = 0.0
                 if "similarity" in m.extra_options:
@@ -202,6 +209,7 @@ class ESConnection(ESConnectionBase):
                           )
 
         if bool_query and rank_feature:
+            # 标签特征或 pagerank 特征通过 rank_feature 追加加权。
             for fld, sc in rank_feature.items():
                 if fld != PAGERANK_FLD:
                     fld = f"{TAG_FLD}.{fld}"
@@ -240,15 +248,15 @@ class ESConnection(ESConnectionBase):
 
         if limit > 0 and not use_search_after:
             s = s[offset:offset + limit]
-        # Filter _source to only requested fields for efficiency, and add vector
-        # fields to "fields" param so they appear in hit.fields when ES 9.x
-        # exclude_source_vectors is enabled (dense_vector not in _source).
+        # 只保留调用方关心的 `_source` 字段，减少返回体积。
+        # 对向量字段则额外放进顶层 `fields`，以兼容 ES 9.x 在
+        # `exclude_source_vectors` 打开时不再把 dense_vector 放进 `_source` 的行为。
         if select_fields:
             s = s.source(select_fields)
         q = s.to_dict()
-        # ES 9.x: dense_vector fields excluded from _source; request them via fields.
-        # Note: knn does NOT have a "fields" parameter - adding it inside the knn
-        # object causes BadRequestError on ES 9.x. We add "fields" at top level.
+        # ES 9.x 下 dense_vector 默认不回到 `_source`，因此需要单独通过 `fields` 取回。
+        # 注意：`knn` 子句内部不能带 `fields`，否则 ES 9.x 会直接报 BadRequestError。
+        # 所以这里把 `fields` 放在查询顶层，而不是 knn 对象内部。
         vector_fields = [f for f in (select_fields or []) if f.endswith("_vec")]
         if vector_fields:
             q["fields"] = vector_fields
@@ -270,7 +278,7 @@ class ESConnection(ESConnectionBase):
                 self._connect()
                 continue
             except Exception as e:
-                # Only log debug for NotFoundError(accepted when metadata index doesn't exist)
+                # 元数据索引不存在时属于可接受场景，只记 debug，避免把日志刷成报错。
                 if 'NotFound' in str(e):
                     self.logger.debug(f"ESConnection.search {str(index_names)} query: " + str(q) + " - " + str(e))
                 else:
@@ -288,7 +296,7 @@ class ESConnection(ESConnectionBase):
             assert "id" in d
             d_copy = copy.deepcopy(d)
             d_copy["kb_id"] = knowledgebase_id
-            # Use id as _id for uniqueness, also keep "id" as a regular field for sorting
+            # 用业务 id 作为 ES `_id` 保证唯一，同时保留普通字段 `id` 便于排序和回传。
             meta_id = d_copy.get("id", "")
             operations.append(
                 {"index": {"_index": index_name, "_id": meta_id}})
@@ -324,7 +332,7 @@ class ESConnection(ESConnectionBase):
         doc.pop("id", None)
         condition["kb_id"] = knowledgebase_id
         if "id" in condition and isinstance(condition["id"], str):
-            # update specific single document
+            # 这种情况表示只更新某一条确定的文档。
             chunk_id = condition["id"]
             for i in range(ATTEMPT_TIME):
                 doc_part = copy.deepcopy(doc)
@@ -500,7 +508,7 @@ class ESConnection(ESConnectionBase):
         assert "_id" not in condition
         condition["kb_id"] = knowledgebase_id
 
-        # Build a bool query that combines id filter with other conditions
+        # 组装 bool 查询，把 chunk id 过滤和其他检索条件合并起来。
         bool_query = Q("bool")
 
         # Handle chunk IDs if present
@@ -509,9 +517,9 @@ class ESConnection(ESConnectionBase):
             if not isinstance(chunk_ids, list):
                 chunk_ids = [chunk_ids]
             if chunk_ids:
-                # Filter by specific chunk IDs
+                # 仅限定在指定 chunk ID 集合内操作。
                 bool_query.filter.append(Q("ids", values=chunk_ids))
-            # If chunk_ids is empty, we don't add an ids filter - rely on other conditions
+            # 如果没有传 chunk_ids，就只依赖其余过滤条件。
 
         # Add all other conditions as filters
         for k, v in condition.items():
@@ -531,7 +539,7 @@ class ESConnection(ESConnectionBase):
             elif v is not None:
                 raise Exception("Condition value must be int, str or list.")
 
-        # If no filters were added, use match_all (for tenant-wide operations)
+        # 如果没有任何过滤条件，则退化成 `match_all`，用于全库级操作。
         if not bool_query.filter and not bool_query.must and not bool_query.must_not:
             qry = Q("match_all")
         else:
@@ -567,7 +575,7 @@ class ESConnection(ESConnectionBase):
         for hit in hits:
             doc_id = hit.get("_id")
             d = hit.get("_source", {})
-            # Also extract fields from ES "fields" response (used by dense_vector in ES 9.x)
+            # 兼容 ES 9.x：有些字段（如 dense_vector）会出现在 `fields` 而不是 `_source` 中。
             hit_fields = hit.get("fields", {})
             m = {}
             for n in fields:

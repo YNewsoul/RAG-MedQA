@@ -1,3 +1,8 @@
+"""文档服务层。
+
+负责文档元数据、解析进度、任务调度入口以及对话态上传后的快速建索引流程。
+阅读建库链路时，这个文件非常关键。
+"""
 
 import asyncio
 import json
@@ -778,6 +783,7 @@ class DocumentService(CommonService):
     @classmethod
     @DB.connection_context()
     def begin2parse(cls, doc_id, keep_progress=False):
+        """把文档标记为已入解析队列。"""
         info = {
             "progress_msg": "Task is queued...",
             "process_begin_at": get_format_time(),
@@ -792,6 +798,7 @@ class DocumentService(CommonService):
     @classmethod
     @DB.connection_context()
     def update_progress(cls):
+        """批量刷新未完成文档的进度。"""
         docs = cls.get_unfinished_docs()
 
         cls._sync_progress(docs)
@@ -807,6 +814,7 @@ class DocumentService(CommonService):
     @classmethod
     @DB.connection_context()
     def _sync_progress(cls, docs: list[dict]):
+        """把任务表状态汇总回文档表。"""
         from api.db.services.task_service import TaskService
 
         for d in docs:
@@ -847,7 +855,7 @@ class DocumentService(CommonService):
                 elif not finished:
                     status = TaskStatus.RUNNING.value
 
-                # only for special task and parsed docs and unfinished
+                # GraphRAG/RAPTOR/Mindmap 这类任务会冻结主解析进度，避免已完成文档进度条回退。
                 freeze_progress = special_task_running and doc_progress >= 1 and not finished
                 msg = "\n".join(sorted(msg))
                 begin_at = d.get("process_begin_at")
@@ -932,6 +940,7 @@ class DocumentService(CommonService):
 
     @classmethod
     def run(cls, tenant_id: str, doc: dict, kb_table_num_map: dict):
+        """文档处理总入口：决定走常规解析队列还是数据流任务。"""
         from api.db.services.task_service import queue_dataflow, queue_tasks
         from api.db.services.file2document_service import File2DocumentService
 
@@ -954,10 +963,7 @@ class DocumentService(CommonService):
 
 
 def queue_raptor_o_graphrag_tasks(sample_doc_id, ty, priority, fake_doc_id="", doc_ids=[]):
-    """
-    You can provide a fake_doc_id to bypass the restriction of tasks at the knowledgebase level.
-    Optionally, specify a list of doc_ids to determine which documents participate in the task.
-    """
+    """为 GraphRAG、RAPTOR、Mindmap 这类增强任务创建并入队。"""
     assert ty in ["graphrag", "raptor", "mindmap"], "type should be graphrag, raptor or mindmap"
 
     chunking_config = DocumentService.get_chunking_config(sample_doc_id["id"])
@@ -999,6 +1005,7 @@ def get_queue_length(priority):
 
 
 def doc_upload_and_parse(conversation_id, file_objs, user_id):
+    """对话态上传文档的快捷路径：上传、切块、向量化并直接写入索引。"""
     from api.db.services.api_service import API4ConversationService
     from api.db.services.conversation_service import ConversationService
     from api.db.services.dialog_service import DialogService
@@ -1042,6 +1049,7 @@ def doc_upload_and_parse(conversation_id, file_objs, user_id):
         kwargs = {"callback": dummy, "parser_config": parser_config, "from_page": 0, "to_page": 100000, "tenant_id": SYSTEM_TENANT_ID, "lang": kb.language}
         threads.append(exe.submit(FACTORY.get(d["parser_id"], naive).chunk, d["name"], blob, **kwargs))
 
+    # 先把 parser 输出整理成统一的索引文档结构。
     for (docinfo, _), th in zip(files, threads):
         docs = []
         doc = {"doc_id": docinfo["id"], "kb_id": [kb.id]}
@@ -1073,6 +1081,7 @@ def doc_upload_and_parse(conversation_id, file_objs, user_id):
     es_bulk_size = 64
 
     def embedding(doc_id, cnts, batch_size=16):
+        """分批生成向量，并累计文档级 token/chunk 统计。"""
         nonlocal embd_mdl, chunk_counts, token_counts
         vectors = []
         for i in range(0, len(cnts), batch_size):
@@ -1091,6 +1100,7 @@ def doc_upload_and_parse(conversation_id, file_objs, user_id):
         cks = [c for c in docs if c["doc_id"] == doc_id]
 
         if parser_ids[doc_id] != ParserType.PICTURE.value:
+            # 非图片文档会额外尝试生成一份整篇摘要图谱，作为补充 chunk。
             from rag.graphrag.general.mind_map_extractor import MindMapExtractor
 
             mindmap = MindMapExtractor(llm_bdl)
@@ -1124,6 +1134,7 @@ def doc_upload_and_parse(conversation_id, file_objs, user_id):
                 if not settings.docStoreConn.index_exist(idxnm, kb_id):
                     settings.docStoreConn.create_idx(idxnm, kb_id, len(vectors[0]), kb.parser_id)
                 try_create_idx = False
+            # 分批 bulk 写入索引，避免一次提交过大。
             settings.docStoreConn.insert(cks[b : b + es_bulk_size], idxnm, kb_id)
 
         DocumentService.increment_chunk_num(doc_id, kb.id, token_counts[doc_id], chunk_counts[doc_id], 0)

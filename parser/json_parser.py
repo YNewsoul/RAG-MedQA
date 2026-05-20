@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 
-#
+"""JSON / JSONL 解析器。
 
-# The following documents are mainly referenced, and only adaptation modifications have been made
-# from https://github.com/langchain-ai/langchain/blob/master/libs/text-splitters/langchain_text_splitters/json.py
+核心目标是把层级很深的 JSON 文档拆成多个结构仍然可读的 chunk，
+便于后续向量化和检索。
+"""
+
+# 主要参考 LangChain 的 JSON splitter 思路，并做了适配性修改：
+# https://github.com/langchain-ai/langchain/blob/master/libs/text-splitters/langchain_text_splitters/json.py
 
 import json
 from typing import Any
@@ -29,25 +33,25 @@ class RAG_MedQAJsonParser:
 
     @staticmethod
     def _json_size(data: dict) -> int:
-        """Calculate the size of the serialized JSON object."""
+        """计算 JSON 对象序列化后的长度。"""
         return len(json.dumps(data, ensure_ascii=False))
 
     @staticmethod
     def _set_nested_dict(d: dict, path: list[str], value: Any) -> None:
-        """Set a value in a nested dictionary based on the given path."""
+        """按路径把值写入嵌套字典。"""
         for key in path[:-1]:
             d = d.setdefault(key, {})
         d[path[-1]] = value
 
     def _list_to_dict_preprocessing(self, data: Any) -> Any:
         if isinstance(data, dict):
-            # Process each key-value pair in the dictionary
+            # 递归处理字典中的每个键值对。
             return {k: self._list_to_dict_preprocessing(v) for k, v in data.items()}
         elif isinstance(data, list):
-            # Convert the list to a dictionary with index-based keys
+            # 把列表转成以索引为 key 的字典，方便保留层级结构。
             return {str(i): self._list_to_dict_preprocessing(item) for i, item in enumerate(data)}
         else:
-            # Base case: the item is neither a dict nor a list, so return it unchanged
+            # 递归终点：标量值原样返回。
             return data
 
     def _json_split(
@@ -56,9 +60,7 @@ class RAG_MedQAJsonParser:
         current_path: list[str] | None,
         chunks: list[dict] | None,
     ) -> list[dict]:
-        """
-        Split json into maximum size dictionaries while preserving structure.
-        """
+        """在尽量保留原始结构的前提下，把 JSON 拆成多个小字典。"""
         current_path = current_path or []
         chunks = chunks or [{}]
         if isinstance(data, dict):
@@ -69,17 +71,17 @@ class RAG_MedQAJsonParser:
                 remaining = self.max_chunk_size - chunk_size
 
                 if size < remaining:
-                    # Add item to current chunk
+                    # 当前 chunk 还能装下时，直接写入。
                     self._set_nested_dict(chunks[-1], new_path, value)
                 else:
                     if chunk_size >= self.min_chunk_size:
-                        # Chunk is big enough, start a new chunk
+                        # 当前块已经足够大，则开启新块。
                         chunks.append({})
 
-                    # Iterate
+                    # 否则继续向下递归拆分当前大字段。
                     self._json_split(value, new_path, chunks)
         else:
-            # handle single item
+            # 处理单个标量值。
             self._set_nested_dict(chunks[-1], current_path, data)
         return chunks
 
@@ -88,7 +90,7 @@ class RAG_MedQAJsonParser:
         json_data,
         convert_lists: bool = False,
     ) -> list[dict]:
-        """Splits JSON into a list of JSON chunks"""
+        """把 JSON 拆成多个 chunk。"""
 
         if convert_lists:
             preprocessed_data = self._list_to_dict_preprocessing(json_data)
@@ -96,7 +98,7 @@ class RAG_MedQAJsonParser:
         else:
             chunks = self._json_split(json_data, None, None)
 
-        # Remove the last chunk if it's empty
+        # 去掉末尾可能产生的空 chunk。
         if not chunks[-1]:
             chunks.pop()
         return chunks
@@ -107,11 +109,11 @@ class RAG_MedQAJsonParser:
         convert_lists: bool = False,
         ensure_ascii: bool = True,
     ) -> list[str]:
-        """Splits JSON into a list of JSON formatted strings"""
+        """把 JSON 拆分结果再转成字符串列表。"""
 
         chunks = self.split_json(json_data=json_data, convert_lists=convert_lists)
 
-        # Convert to string
+        # 最终输出字符串形式，便于进入后续切块/索引流程。
         return [json.dumps(chunk, ensure_ascii=ensure_ascii) for chunk in chunks]
 
     def _parse_json(self, content: str) -> list[str]:

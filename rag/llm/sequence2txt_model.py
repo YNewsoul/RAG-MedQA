@@ -1,3 +1,9 @@
-# Stub: sequence2txt_model not implemented in this fork
+"""序列转文本模型占位模块。
+
+通常这类模型会用于语音转文字或其他序列到文本任务。
+当前分支未保留具体实现，仅保留基类占位。
+"""
+
 class Base:
+    """序列到文本模型基类占位实现。"""
     pass

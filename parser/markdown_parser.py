@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 
-#
+"""Markdown 解析辅助。
+
+负责把 Markdown 中的表格、标题、代码块、列表、引用块等元素拆开，
+为后续 chunk 切分提供更稳定的结构化输入。
+"""
 
 import re
 
@@ -22,10 +26,10 @@ class RAG_MedQAMarkdownParser:
                 raw_table = match.group()
                 table_list.append(raw_table)
                 if separate_tables:
-                    # Skip this match (i.e., remove it)
+                    # 单独抽表模式下，把表格从正文中移除，保留一个空位。
                     new_text += working_text[last_end : match.start()] + "\n\n"
                 else:
-                    # Replace with rendered HTML
+                    # 否则直接把表格渲染成 HTML 塞回正文。
                     html_table = markdown(raw_table, extensions=["markdown.extensions.tables"]) if render else raw_table
                     new_text += working_text[last_end : match.start()] + html_table + "\n\n"
                 last_end = match.end()
@@ -33,7 +37,7 @@ class RAG_MedQAMarkdownParser:
             return new_text
 
         if "|" in markdown_text:  # for optimize performance
-            # Standard Markdown table
+            # 标准 Markdown 表格。
             border_table_pattern = re.compile(
                 r"""
                 (?:\n|^)
@@ -45,7 +49,7 @@ class RAG_MedQAMarkdownParser:
             )
             working_text = replace_tables_with_rendered_html(border_table_pattern, tables, render=separate_tables)
 
-            # Borderless Markdown table
+            # 无边框 Markdown 表格。
             no_border_table_pattern = re.compile(
                 r"""
                 (?:\n|^)
@@ -57,7 +61,7 @@ class RAG_MedQAMarkdownParser:
             )
             working_text = replace_tables_with_rendered_html(no_border_table_pattern, tables, render=separate_tables)
 
-        # Replace any TAGS e.g. <table ...> to <table>
+        # 统一 HTML 标签形式，去掉属性，便于后续识别表格。
         TAGS = ["table", "td", "tr", "th", "tbody", "thead", "div"]
         table_with_attributes_pattern = re.compile(rf"<(?:{'|'.join(TAGS)})[^>]*>", re.IGNORECASE)
 
@@ -68,7 +72,7 @@ class RAG_MedQAMarkdownParser:
         working_text = re.sub(table_with_attributes_pattern, replace_tag, working_text)
 
         if "<table>" in working_text.lower():  # for optimize performance
-            # HTML table extraction - handle possible html/body wrapper tags
+            # 提取 HTML 表格，同时兼容 html/body 包裹层。
             html_table_pattern = re.compile(
                 r"""
             (?:\n|^)
@@ -120,7 +124,7 @@ class MarkdownElementExtractor:
         return "|".join(re.escape(t) for t in toks if t)
 
     def extract_elements(self, delimiter=None, include_meta=False):
-        """Extract individual elements (headers, code blocks, lists, etc.)"""
+        """提取 Markdown 中的独立结构单元（标题、代码块、列表等）。"""
         sections = []
 
         i = 0
@@ -161,27 +165,27 @@ class MarkdownElementExtractor:
             line = self.lines[i]
 
             if re.match(r"^#{1,6}\s+.*$", line):
-                # header
+                # 标题块。
                 element = self._extract_header(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
             elif line.strip().startswith("```"):
-                # code block
+                # 代码块。
                 element = self._extract_code_block(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
             elif re.match(r"^\s*[-*+]\s+.*$", line) or re.match(r"^\s*\d+\.\s+.*$", line):
-                # list block
+                # 列表块。
                 element = self._extract_list_block(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
             elif line.strip().startswith(">"):
-                # blockquote
+                # 引用块。
                 element = self._extract_blockquote(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
             elif line.strip():
-                # text block (paragraphs and inline elements until next block element)
+                # 普通文本块，一直读到下一个结构化块为止。
                 element = self._extract_text_block(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
@@ -206,7 +210,7 @@ class MarkdownElementExtractor:
         end_pos = start_pos
         content_lines = [self.lines[start_pos]]
 
-        # Find the end of the code block
+        # 一直找到代码块结束位置。
         for i in range(start_pos + 1, len(self.lines)):
             content_lines.append(self.lines[i])
             end_pos = i

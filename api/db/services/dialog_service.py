@@ -1,3 +1,23 @@
+"""对话服务层。
+
+这个文件承接项目最核心的 RAG (Retrieval-Augmented Generation) 问答编排：
+
+核心职责：
+1. **模型绑定**：绑定聊天模型(LLM)、向量模型(Embedding)与重排模型(Rerank)
+2. **问题处理**：执行问题改写、多轮对话整合、关键词补强
+3. **检索编排**：支持向量检索、SQL检索、网页检索(Tavily)
+4. **Prompt组装**：将检索到的知识片段组装成提示词
+5. **引用增强**：在回答后自动补充引用标记和来源
+
+关键函数说明：
+- `async_chat()`: RAG 主链路入口，协调所有组件完成问答
+- `async_chat_solo()`: 无知识库时的纯 LLM 对话
+- `get_models()`: 获取对话所需的各类模型实例
+- `use_sql()`: SQL 检索模式，支持结构化数据查询
+- `structure_answer()`: 答案结构整理（在 conversation_service.py 中）
+
+阅读建议：与 `conversation_service.py` 配套阅读，理解完整的问答流程。
+"""
 
 import asyncio
 import binascii
@@ -36,34 +56,30 @@ from common import settings
 
 
 class DialogService(CommonService):
-    model = Dialog
+    """对话服务类，继承自 CommonService。
+
+    提供对话（Dialog）的数据库操作，包括增删改查。
+    对话是 RAG 系统的核心配置单元，包含知识库关联、模型配置、提示词配置等。
+    """
+    model = Dialog  # 指定数据库模型
 
     @classmethod
     def save(cls, **kwargs):
-        """Save a new record to database.
-
-        This method creates a new record in the database with the provided field values,
-        forcing an insert operation rather than an update.
-
+        """向数据库插入一条新的对话记录。
         Args:
-            **kwargs: Record field values as keyword arguments.
-
+            **kwargs: 对话字段键值对
         Returns:
-            Model instance: The created record object.
+            int: 插入记录的 ID
         """
         sample_obj = cls.model(**kwargs).save(force_insert=True)
         return sample_obj
 
     @classmethod
     def update_many_by_id(cls, data_list):
-        """Update multiple records by their IDs.
-
-        This method updates multiple records in the database, identified by their IDs.
-        It automatically updates the update_time and update_date fields for each record.
+        """按 ID 批量更新记录，并刷新更新时间字段。
 
         Args:
-            data_list (list): List of dictionaries containing record data to update.
-                             Each dictionary must include an 'id' field.
+            data_list (list[dict]): 要更新的记录列表，每条记录需包含 "id" 字段
         """
         with DB.atomic():
             for data in data_list:
@@ -74,12 +90,28 @@ class DialogService(CommonService):
     @classmethod
     @DB.connection_context()
     def get_list(cls, tenant_id, page_number, items_per_page, orderby, desc, id, name):
+        """分页查询有效对话列表。
+
+        Args:
+            tenant_id (str): 租户ID
+            page_number (int): 页码
+            items_per_page (int): 每页大小
+            orderby (str): 排序字段
+            desc (bool): 是否降序
+            id (str): 对话ID筛选（可选）
+            name (str): 对话名称筛选（可选）
+
+        Returns:
+            tuple: (对话列表, 总数)
+        """
         chats = cls.model.select()
         if id:
             chats = chats.where(cls.model.id == id)
         if name:
             chats = chats.where(cls.model.name == name)
+        # 只查询有效状态的对话
         chats = chats.where(cls.model.status == StatusEnum.VALID.value)
+        # 排序处理
         if desc:
             chats = chats.order_by(cls.model.getter_by(orderby).desc())
         else:
@@ -186,64 +218,136 @@ class DialogService(CommonService):
 
 
 async def async_chat_solo(dialog, messages, stream=True):
+    """无知识库时的纯 LLM 对话。
+
+    当对话没有绑定任何知识库且没有配置 Tavily 搜索时，
+    直接调用 LLM 进行回答，不进行检索增强。
+
+    Args:
+        dialog (Dialog): 对话对象
+        messages (list[dict]): 消息列表
+        stream (bool): 是否流式响应
+
+    Yields:
+        dict: 包含 answer, reference, audio_binary 等字段的响应
+    """
+    # 获取 LLM 类型（chat 或 image2text）
     llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
     attachments = ""
     image_attachments = []
     image_files = []
+
+    # 处理附件
     if "files" in messages[-1]:
         if llm_type == "chat":
             text_attachments, image_attachments = split_file_attachments(messages[-1]["files"])
         else:
             text_attachments, image_files = split_file_attachments(messages[-1]["files"], raw=True)
         attachments = "\n\n".join(text_attachments)
+
+    # 获取聊天模型
     model_config = get_model_config_by_id(dialog.tenant_llm_id)
     chat_mdl = LLMBundle(model_config)
     factory = model_config.get("llm_factory", "") if model_config else ""
 
+    # 初始化 TTS 模型（如果配置了）
     prompt_config = dialog.prompt_config
     tts_mdl = None
     if prompt_config.get("tts"):
         default_tts_model = get_tenant_default_model_by_type(LLMType.TTS)
         tts_mdl = LLMBundle(default_tts_model)
-    msg = [{"role": m["role"], "content": re.sub(r"##\d+\$\$", "", m["content"])} for m in messages if m["role"] != "system"]
+
+    # 构建消息列表（移除 system 消息和引用标记）
+    msg = [{"role": m["role"], "content": re.sub(r"##\d+\$\$", "", m["content"])} 
+           for m in messages if m["role"] != "system"]
+    
+    # 附加文件内容到最后一条消息
     if attachments and msg:
         msg[-1]["content"] += attachments
+
+    # 处理多模态输入（图片）
     if llm_type == "chat" and image_attachments:
         convert_last_user_msg_to_multimodal(msg, image_attachments, factory)
+
+    # 流式响应
     if stream:
         if llm_type == "chat":
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting)
+            stream_iter = chat_mdl.async_chat_streamly_delta(
+                prompt_config.get("system", ""), msg, dialog.llm_setting
+            )
         else:
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files)
+            stream_iter = chat_mdl.async_chat_streamly_delta(
+                prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files
+            )
         async for kind, value, state in _stream_with_think_delta(stream_iter):
             if kind == "marker":
+                # 思考模式标记
                 flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
-                yield {"answer": "", "reference": {}, "audio_binary": None, "prompt": "", "created_at": time.time(), "final": False, **flags}
+                yield {
+                    "answer": "", "reference": {}, "audio_binary": None, 
+                    "prompt": "", "created_at": time.time(), "final": False, **flags
+                }
                 continue
-            yield {"answer": value, "reference": {}, "audio_binary": tts(tts_mdl, value), "prompt": "", "created_at": time.time(), "final": False}
+            yield {
+                "answer": value, "reference": {}, "audio_binary": tts(tts_mdl, value), 
+                "prompt": "", "created_at": time.time(), "final": False
+            }
     else:
+        # 非流式响应
         if llm_type == "chat":
-            answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting)
+            answer = await chat_mdl.async_chat(
+                prompt_config.get("system", ""), msg, dialog.llm_setting
+            )
         else:
-            answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files)
+            answer = await chat_mdl.async_chat(
+                prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files
+            )
         user_content = msg[-1].get("content", "[content not available]")
         logging.debug("User: {}|Assistant: {}".format(user_content, answer))
-        yield {"answer": answer, "reference": {}, "audio_binary": tts(tts_mdl, answer), "prompt": "", "created_at": time.time()}
+        yield {
+            "answer": answer, "reference": {}, "audio_binary": tts(tts_mdl, answer), 
+            "prompt": "", "created_at": time.time()
+        }
 
 
 def get_models(dialog):
+    """获取对话所需的所有模型实例。
+
+    根据对话配置，获取知识库、向量模型、重排模型、聊天模型和 TTS 模型。
+
+    Args:
+        dialog (Dialog): 对话对象
+
+    Returns:
+        tuple: (kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl)
+            - kbs: 知识库列表
+            - embd_mdl: 向量模型（Embedding）
+            - rerank_mdl: 重排模型
+            - chat_mdl: 聊天模型（LLM）
+            - tts_mdl: TTS 语音合成模型
+
+    Raises:
+        Exception: 多个知识库使用不同的嵌入模型
+        LookupError: 嵌入模型未找到
+    """
     embd_mdl, chat_mdl, rerank_mdl, tts_mdl = None, None, None, None
+
+    # 获取关联的知识库
     kbs = KnowledgebaseService.get_by_ids(dialog.kb_ids)
+
+    # 提取所有知识库使用的嵌入模型（必须一致）
     embedding_list = list(set([kb.embd_id for kb in kbs]))
     if len(embedding_list) > 1:
         raise Exception("**ERROR**: Knowledge bases use different embedding models.")
 
+    # 初始化向量模型
     if embedding_list:
         embd_model_config = get_model_config_by_type_and_name(LLMType.EMBEDDING, embedding_list[0])
         embd_mdl = LLMBundle(embd_model_config)
         if not embd_mdl:
             raise LookupError("Embedding model(%s) not found" % embedding_list[0])
 
+    # 初始化聊天模型（优先级：tenant_llm_id > llm_id > 默认模型）
     if dialog.tenant_llm_id:
         chat_model_config = get_model_config_by_id(dialog.tenant_llm_id)
     elif dialog.llm_id:
@@ -253,22 +357,39 @@ def get_models(dialog):
 
     chat_mdl = LLMBundle(chat_model_config)
 
+    # 初始化重排模型（可选）
     if dialog.rerank_id:
         rerank_model_config = get_model_config_by_type_and_name(LLMType.RERANK, dialog.rerank_id)
         rerank_mdl = LLMBundle(rerank_model_config)
 
+    # 初始化 TTS 模型（可选）
     if dialog.prompt_config.get("tts"):
         default_tts_model_config = get_tenant_default_model_by_type(LLMType.TTS)
         tts_mdl = LLMBundle(default_tts_model_config)
+
     return kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl
 
 
 def split_file_attachments(files: list[dict] | None, raw: bool = False) -> tuple[list[str], list[str] | list[dict]]:
+    """分离文件附件为文本和图片。
+
+    将用户上传的文件附件分离为文本内容和图片内容两类。
+
+    Args:
+        files (list[dict]): 文件列表
+        raw (bool): 是否返回原始文件对象（用于 image2text 模型）
+
+    Returns:
+        tuple: (text_attachments, image_attachments)
+            - text_attachments: 文本内容列表
+            - image_attachments: 图片内容列表（data URI 格式或原始对象）
+    """
     if not files:
         return [], []
 
     text_attachments = []
     if raw:
+        # image2text 模型需要原始文件对象
         file_contents, image_files = FileService.get_files(files, raw=True)
         for content in file_contents:
             if not isinstance(content, str):
@@ -276,10 +397,12 @@ def split_file_attachments(files: list[dict] | None, raw: bool = False) -> tuple
             text_attachments.append(content)
         return text_attachments, image_files
 
+    # chat 模型使用 data URI 格式
     image_attachments = []
     for content in FileService.get_files(files, raw=False):
         if not isinstance(content, str):
             content = str(content)
+        # 判断是否为图片（data URI 格式）
         if content.strip().startswith("data:"):
             image_attachments.append(content.strip())
             continue
@@ -320,11 +443,22 @@ def _normalize_text_from_content(content) -> str:
 
 
 def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[str], factory: str) -> None:
+    """将最后一条用户消息转换为多模态格式。
+
+    根据不同的 LLM 工厂类型（Gemini、Anthropic、通用），
+    将图片附件转换为对应的多模态消息格式。
+
+    Args:
+        msg (list[dict]): 消息列表
+        image_data_uris (list[str]): 图片 data URI 列表
+        factory (str): LLM 工厂名称（gemini、anthropic 等）
+    """
     if not msg or not image_data_uris:
         return
 
     factory_norm = (factory or "").strip().lower()
 
+    # 从后往前找到最后一条用户消息
     for idx in range(len(msg) - 1, -1, -1):
         if msg[idx].get("role") != "user":
             continue
@@ -332,6 +466,7 @@ def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[s
         original_content = msg[idx].get("content", "")
         text = _normalize_text_from_content(original_content)
 
+        # Gemini 格式
         if factory_norm == "gemini":
             parts = []
             if text:
@@ -342,21 +477,21 @@ def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[s
             msg[idx]["content"] = parts
             return
 
+        # Anthropic 格式
         if factory_norm == "anthropic":
             blocks = []
             if text:
                 blocks.append({"type": "text", "text": text})
             for image in image_data_uris:
                 mime, b64 = _parse_data_uri_or_b64(str(image), default_mime="image/png")
-                blocks.append(
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": mime, "data": b64},
-                    }
-                )
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": b64},
+                })
             msg[idx]["content"] = blocks
             return
 
+        # 通用格式（OpenAI 风格）
         multimodal_content = []
         if isinstance(original_content, list):
             multimodal_content = deepcopy(original_content)
@@ -377,25 +512,42 @@ def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[s
         return
 
 
+# 引用格式修复模式（处理模型输出的非标准引用格式）
 BAD_CITATION_PATTERNS = [
     re.compile(r"\(\s*ID\s*[: ]*\s*(\d+)\s*\)"),  # (ID: 12)
     re.compile(r"\[\s*ID\s*[: ]*\s*(\d+)\s*\]"),  # [ID: 12]
     re.compile(r"【\s*ID\s*[: ]*\s*(\d+)\s*】"),  # 【ID: 12】
     re.compile(r"ref\s*(\d+)", flags=re.IGNORECASE),  # ref12、REF 12
 ]
+# 标准引用标记模式
 CITATION_MARKER_PATTERN = re.compile(r"\[(?:ID:)?([0-9\u0660-\u0669\u06F0-\u06F9]+)\]")
 
 
 def repair_bad_citation_formats(answer: str, kbinfos: dict, idx: set):
+    """修复模型输出中的非标准引用格式。
+
+    将模型输出的各种非标准引用格式统一转换为标准格式 [ID:数字]，
+    同时记录有效的引用索引。
+
+    Args:
+        answer (str): 模型回答文本
+        kbinfos (dict): 知识库信息（包含 chunks）
+        idx (set): 引用索引集合（用于记录有效的引用ID）
+
+    Returns:
+        tuple: (修复后的回答, 更新后的引用索引集合)
+    """
     max_index = len(kbinfos["chunks"])
     normalized_answer = normalize_arabic_digits(answer) or ""
 
+    # 安全添加索引（确保在有效范围内）
     def safe_add(i):
         if 0 <= i < max_index:
             idx.add(i)
             return True
         return False
 
+    # 查找并替换引用格式
     def find_and_replace(pattern, group_index=1, repl=lambda digits: f"ID:{digits}"):
         nonlocal answer
         nonlocal normalized_answer
@@ -427,6 +579,7 @@ def repair_bad_citation_formats(answer: str, kbinfos: dict, idx: set):
         answer = "".join(parts)
         normalized_answer = normalize_arabic_digits(answer) or ""
 
+    # 应用所有修复模式
     for pattern in BAD_CITATION_PATTERNS:
         find_and_replace(pattern)
 
@@ -434,82 +587,206 @@ def repair_bad_citation_formats(answer: str, kbinfos: dict, idx: set):
 
 
 async def async_chat(dialog, messages, stream=True, **kwargs):
-    logging.debug("Begin async_chat")
+    """执行一次完整的 RAG (Retrieval-Augmented Generation) 对话主链路。
+
+    RAG 主流程架构（9个阶段）：
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ 阶段1: 输入校验 → 阶段2: 模型绑定 → 阶段3: 附件处理               │
+    │         ↓                                                          │
+    │ 阶段4: SQL检索(优先) → 阶段5: 问题增强 → 阶段6: 向量检索          │
+    │         ↓                                                          │
+    │ 阶段7: Prompt组装 → 阶段8: LLM推理 → 阶段9: 引用后处理           │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    核心功能说明：
+    - 支持多模态输入（文本、图片、文件附件）
+    - 支持多种检索方式（向量检索、SQL检索、网页检索）
+    - 支持深度研究模式（LLM驱动的多步推理）
+    - 支持流式/非流式响应
+    - 自动添加引用和性能统计
+
+    Args:
+        dialog (Dialog): 对话配置对象，包含以下关键属性：
+            - kb_ids: 关联的知识库ID列表
+            - llm_id/tenant_llm_id: LLM模型标识
+            - rerank_id: 重排模型标识（可选）
+            - prompt_config: 提示词配置（system提示、参数、引用设置等）
+            - similarity_threshold: 向量相似度阈值
+            - vector_similarity_weight: 向量相似度权重
+            - top_n/top_k: 检索数量参数
+            - meta_data_filter: 元数据过滤器
+
+        messages (list[dict]): 对话消息列表，每条消息包含：
+            - role: 角色（user/system/assistant）
+            - content: 消息内容
+            - files/doc_ids: 附件（可选）
+            要求：最后一条消息必须是 user 角色
+
+        stream (bool): 是否流式响应（SSE），默认为 True
+            - True: 返回 Server-Sent Events 流式响应
+            - False: 返回完整的单个响应
+
+        **kwargs: 额外参数：
+            - kb_ids: 临时指定的知识库ID列表（覆盖对话默认配置）
+            - doc_ids: 指定的文档ID列表（用于限定检索范围）
+            - files: 运行时附件文件
+            - reasoning: 是否启用深度研究模式
+            - quote: 是否添加引用
+            - toolcall_session/tools: 工具调用配置
+
+    Yields:
+        dict: 响应字典，包含以下字段：
+            - answer: 回答内容
+            - reference: 引用信息（包含 chunks 和 doc_aggs）
+            - audio_binary: TTS语音二进制数据（可选）
+            - prompt: 完整提示词（含调试信息）
+            - created_at: 创建时间戳
+            - final: 是否为最终响应
+            - start_to_think/end_to_think: 思考模式标记
+
+    Raises:
+        AssertionError: 最后一条消息不是用户消息
+        KeyError: 缺少必填参数
+        LookupError: 模型未找到
+    """
+    logging.debug("Begin async_chat - RAG main pipeline start")
+
+    # ==================== 阶段1：输入校验 ====================
+    # 断言：最后一条消息必须来自用户
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
+
+    # 快速路径：无知识库且无Tavily配置时，直接使用纯LLM对话
     if not dialog.kb_ids and not dialog.prompt_config.get("tavily_api_key"):
+        logging.debug("No knowledge base and no Tavily configured, using LLM-only chat")
         async for ans in async_chat_solo(dialog, messages, stream):
             yield ans
         return
 
+    # ==================== 阶段2：模型配置获取与绑定 ====================
+    # 记录开始时间（用于性能统计）
     chat_start_ts = timer()
+
+    # 获取LLM类型（chat 或 image2text）
     llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
+    logging.debug(f"LLM type detected: {llm_type}")
+
+    # 根据类型获取模型配置
     if llm_type == "image2text":
         llm_model_config = get_model_config_by_type_and_name(LLMType.IMAGE2TEXT, dialog.llm_id)
     else:
         llm_model_config = get_model_config_by_type_and_name(LLMType.CHAT, dialog.llm_id)
 
+    # 提取模型工厂和最大token数
     factory = llm_model_config.get("llm_factory", "") if llm_model_config else ""
     max_tokens = llm_model_config.get("max_tokens", 8192)
+    logging.debug(f"LLM factory: {factory}, max_tokens: {max_tokens}")
 
     check_llm_ts = timer()
 
+    # 获取所有需要的模型实例
+    # 返回：(知识库列表, 向量模型, 重排模型, 聊天模型, TTS模型)
     kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl = get_models(dialog)
+    logging.debug(f"Models loaded: embd={embd_mdl is not None}, rerank={rerank_mdl is not None}, chat={chat_mdl is not None}, tts={tts_mdl is not None}")
+
+    # 如果配置了工具调用，绑定工具到聊天模型
     toolcall_session, tools = kwargs.get("toolcall_session"), kwargs.get("tools")
     if toolcall_session and tools:
         chat_mdl.bind_tools(toolcall_session, tools)
+        logging.debug(f"Tools bound to chat model: {len(tools)} tools")
+
     bind_models_ts = timer()
 
+    # ==================== 阶段3：问题提取与附件处理 ====================
+    # 获取检索器实例
     retriever = settings.retriever
+
+    # 提取最近3条用户消息行成 questions 列表（用于多轮对话上下文）
     questions = [m["content"] for m in messages if m["role"] == "user"][-3:]
+    logging.debug(f"Extracted {len(questions)} user questions for retrieval")
+
+    # 处理文档ID附件（从kwargs或消息中获取）
     attachments = None
     if "doc_ids" in kwargs:
         attachments = [doc_id for doc_id in kwargs["doc_ids"].split(",") if doc_id]
-    attachments_= ""
-    image_attachments = []
-    image_files = []
+
+    # 处理文件附件，后续直接拼进系统 prompt，作为额外上下文
+    attachments_ = ""  # 文本附件内容
+    image_attachments = []  # chat模型用的图片（data URI格式）
+    image_files = []  # image2text模型用的图片（原始格式）
+
     if "doc_ids" in messages[-1]:
         attachments = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
+
     if "files" in messages[-1]:
         if llm_type == "chat":
+            # chat模型：分离文本和图片（data URI格式）
             text_attachments, image_attachments = split_file_attachments(messages[-1]["files"])
         else:
+            # image2text模型：使用原始文件格式
             text_attachments, image_files = split_file_attachments(messages[-1]["files"], raw=True)
         attachments_ = "\n\n".join(text_attachments)
+        logging.debug(f"Processed {len(text_attachments)} text attachments and {len(image_attachments + image_files)} image attachments")
 
     prompt_config = dialog.prompt_config
+
+    # ==================== 阶段4：SQL检索（优先路径） ====================
+    # 检查知识库是否有字段映射（结构化数据）
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
-    logging.debug(f"field_map retrieved: {field_map}")
-    # try to use sql if field mapping is good to go
+    logging.debug(f"Field map retrieved: {field_map}")
+
+    # 如果存在字段映射，优先使用SQL检索（适用于结构化查询）
     if field_map:
-        logging.debug("Use SQL to retrieval:{}".format(questions[-1]))
-        ans = await use_sql(questions[-1], field_map, SYSTEM_TENANT_ID, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
-        # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid
+        logging.debug(f"SQL retrieval available, query: {questions[-1]}")
+        ans = await use_sql(
+            question=questions[-1],
+            field_map=field_map,
+            tenant_id=SYSTEM_TENANT_ID,
+            chat_mdl=chat_mdl,
+            quota=prompt_config.get("quote", True),
+            kb_ids=dialog.kb_ids
+        )
+
+        # 检查SQL结果：聚合查询（如COUNT、SUM）可能没有chunk但答案有效
         if ans and (ans.get("reference", {}).get("chunks") or ans.get("answer")):
+            logging.debug("SQL retrieval successful, returning result")
             yield ans
             return
         else:
-            logging.debug("SQL failed or returned no results, falling back to vector search")
+            logging.debug("SQL retrieval failed or returned no results, falling back to vector search")
 
+    # ==================== 阶段5：检索前问题预处理：把原始问题加工成更适合检索的问题 ====================
+    # 获取提示词参数列表
     param_keys = [p["key"] for p in prompt_config.get("parameters", [])]
-    logging.debug(f"attachments={attachments}, param_keys={param_keys}, embd_mdl={embd_mdl}")
+    logging.debug(f"Prompt parameters: {param_keys}, attachments: {attachments}")
 
+    # 5.1 参数校验：检查必填参数是否存在
     for p in prompt_config["parameters"]:
         if p["key"] == "knowledge":
-            continue
+            continue  # knowledge参数由系统自动填充
+        # 必填参数缺失检查
         if p["key"] not in kwargs and not p["optional"]:
-            raise KeyError("Miss parameter: " + p["key"])
+            raise KeyError("Missing required parameter: " + p["key"])
+        # 可选参数未提供时，从系统提示词中移除占位符
         if p["key"] not in kwargs:
             prompt_config["system"] = prompt_config["system"].replace("{%s}" % p["key"], " ")
 
+    # 5.2 多轮对话整合：将历史对话合并为完整问题
     if len(questions) > 1 and prompt_config.get("refine_multiturn"):
+        logging.debug("Refining multi-turn conversation into single question")
         questions = [await full_question(dialog.llm_id, messages)]
     else:
+        # 只保留最新一条问题
         questions = questions[-1:]
 
+    # 5.3跨语言转换：将问题转换为目标语言（如中文转英文）
     if prompt_config.get("cross_languages"):
-        questions = [await cross_languages(dialog.llm_id, questions[0], prompt_config["cross_languages"])]
+        target_lang = prompt_config["cross_languages"]
+        logging.debug(f"Translating question to {target_lang}")
+        questions = [await cross_languages(dialog.llm_id, questions[0], target_lang)]
 
+    # 5.4 元数据过滤：根据元数据条件筛选文档
     if dialog.meta_data_filter:
+        logging.debug("Applying metadata filter")
         metas = DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids)
         attachments = await apply_meta_data_filter(
             dialog.meta_data_filter,
@@ -519,19 +796,28 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             attachments,
         )
 
+    # 5.5 关键词补强：自动提取并追加关键词到问题中，提升检索准确性
     if prompt_config.get("keyword", False):
-        questions[-1] += await keyword_extraction(chat_mdl, questions[-1])
+        logging.debug("Performing keyword extraction")
+        keywords = await keyword_extraction(chat_mdl, questions[-1])
+        questions[-1] += keywords
+        logging.debug(f"Enhanced question with keywords: {questions[-1]}")
 
     refine_question_ts = timer()
 
-    thought = ""
-    kbinfos = {"total": 0, "chunks": [], "doc_aggs": []}
-    knowledges = []
+    # ==================== 阶段6：检索执行 ====================
+    thought = ""  # 思考内容存储（用于思考模式）
+    # 检索结果容器
+    kbinfos = {"total": 0, "chunks": [], "doc_aggs": []}  
+    knowledges = []  # 后面会注入 prompt 的知识文本片段
 
     if "knowledge" in param_keys:
         logging.debug("Proceeding with retrieval")
         knowledges = []
+        # ==================== 深度研究模式 ====================
         if prompt_config.get("reasoning", False) or kwargs.get("reasoning"):
+            logging.debug("Enabling Deep Research mode for complex reasoning")
+            # 深度研究模式：LLM驱动的多步推理，持续向前端输出思考过程
             reasoner = DeepResearcher(
                 chat_mdl,
                 prompt_config,
@@ -546,8 +832,11 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     doc_ids=attachments,
                 ),
             )
+            # 创建异步队列用于接收思考过程
             queue = asyncio.Queue()
+
             async def callback(msg:str):
+                """回调函数：接收深度研究的中间结果"""
                 nonlocal queue
                 await queue.put(msg + "<br/>")
 
@@ -567,6 +856,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
         else:
             if embd_mdl:
+                # 标准 RAG 路径：召回 chunk，必要时再做 TOC 增强和父子块合并。
                 kbinfos = await retriever.retrieval(
                     " ".join(questions),
                     embd_mdl,
@@ -581,110 +871,188 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     rerank_mdl=rerank_mdl,
                     rank_feature=label_question(" ".join(questions), kbs),
                 )
+                # 基于目录结构补召回
                 if prompt_config.get("toc_enhance"):
                     cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], chat_mdl, dialog.top_n)
                     if cks:
                         kbinfos["chunks"] = cks
+                # 命中子块时回收到父块，通常能给模型更完整的上下文。
                 kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos["chunks"])
             if prompt_config.get("tavily_api_key"):
+                # 可选混入网页检索结果，作为外部知识补充。
                 tav = Tavily(prompt_config["tavily_api_key"])
                 tav_res = tav.retrieve_chunks(" ".join(questions))
                 kbinfos["chunks"].extend(tav_res["chunks"])
                 kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
+    # 将检索到的知识片段格式化为prompt格式
     knowledges = kb_prompt(kbinfos, max_tokens)
     logging.debug("{}->{}".format(" ".join(questions), "\n->".join(knowledges)))
 
     retrieval_ts = timer()
+
+    # 空结果处理：如果没有检索到知识且配置了空响应
     if not knowledges and prompt_config.get("empty_response"):
         empty_res = prompt_config["empty_response"]
-        yield {"answer": empty_res, "reference": kbinfos, "prompt": "\n\n### Query:\n%s" % " ".join(questions),
-               "audio_binary": tts(tts_mdl, empty_res), "final": True}
+        yield {
+            "answer": empty_res, 
+            "reference": kbinfos, 
+            "prompt": "\n\n### Query:\n%s" % " ".join(questions),
+            "audio_binary": tts(tts_mdl, empty_res), 
+            "final": True
+        }
         return
 
+    # ==================== 阶段7：Prompt组装 ====================
+    # 7.1 将知识片段添加到kwargs中
     kwargs["knowledge"] = "\n------\n" + "\n\n------\n\n".join(knowledges)
+
+    # 7.2 获取LLM生成配置
     gen_conf = dialog.llm_setting
 
-    _system_content = prompt_config["system"].format(**kwargs) + attachments_
+    # 7.3 构建系统提示词内容
+    _system_content = prompt_config["system"].format(**kwargs) + attachments_ # 合并系统提示词和附件
+
+    # 添加医疗免责声明（可通过环境变量关闭）
     if os.getenv("MEDICAL_DISCLAIMER_ENABLED", "true").lower() != "false":
         _system_content += (
             "\n\n---\n⚠️ 免责声明：本系统基于知识库提供医疗参考信息，不构成正式医疗建议，"
             "具体诊疗请以执业医师的专业判断为准。"
         )
+
+    # 7.4 构建新的消息列表，第一条为系统提示词
     msg = [{"role": "system", "content": _system_content}]
+
+    # 添加引用提示词（如果启用引用）
     prompt4citation = ""
     if knowledges and (prompt_config.get("quote", True) and kwargs.get("quote", True)):
         prompt4citation = citation_prompt()
-    msg.extend([{"role": m["role"], "content": re.sub(r"##\d+\$\$", "", m["content"])} for m in messages if m["role"] != "system"])
+
+    # 7.5 添加 添加用户消息（过滤掉系统消息和引用标记）
+    msg.extend([
+        {"role": m["role"], "content": re.sub(r"##\d+\$\$", "", m["content"])}
+        for m in messages if m["role"] != "system"
+    ])
+
+    # 7.6 确保消息token数在模型限制内
     used_token_count, msg = message_fit_in(msg, int(max_tokens * 0.95))
+
+    # 7.7 处理多模态消息（图片），把图片挂到最后一条 user message 上
     if llm_type == "chat" and image_attachments:
         convert_last_user_msg_to_multimodal(msg, image_attachments, factory)
+
+    # 断言：确保至少有系统消息和一条用户消息
     assert len(msg) >= 2, f"message_fit_in has bug: {msg}"
+
+    # 提取prompt内容（用于日志和调试）
     prompt = msg[0]["content"]
 
+    # 计算可用的生成token数
     if "max_tokens" in gen_conf:
         gen_conf["max_tokens"] = min(gen_conf["max_tokens"], max_tokens - used_token_count)
 
+    # ==================== 阶段8：答案后处理函数 ====================
     def decorate_answer(answer):
+        """答案后处理函数：补引用、修复引用格式，并附加调试信息。
+        把“模型原始输出”加工成“系统最终答案”
+
+        主要职责：
+        1. 分离思考块（<think>...</think>）- 提取LLM的内部推理过程
+        2. 插入/修复引用标记 - 如果模型未显式给出引用，则通过相似度反推
+        3. 过滤引用文档 - 根据引用的chunk筛选相关文档
+        4. 添加性能统计信息 - 记录各阶段耗时和Token使用情况
+        5. 处理API Key错误 - 提供友好的错误提示
+
+        Args:
+            answer (str): LLM 原始回答，可能包含 <think> 标签和引用标记
+
+        Returns:
+            dict: 包含以下字段的结果字典：
+                - answer: 处理后的回答（含思考块）
+                - reference: 引用信息（chunks和doc_aggs，移除了向量数据）
+                - prompt: 完整提示词（含性能统计）
+                - created_at: 创建时间戳
+        """
+        # 使用nonlocal声明以修改外层作用域的变量
         nonlocal embd_mdl, prompt_config, knowledges, kwargs, kbinfos, prompt, retrieval_ts, questions
 
         refs = []
+
+        # ---------------------- 步骤1：分离思考块 ----------------------
+        # 将回答拆分为思考块和实际答案
         ans = answer.split("</think>")
         think = ""
         if len(ans) == 2:
-            think = ans[0] + "</think>"
-            answer = ans[1]
+            think = ans[0] + "</think>"  # 保留思考块标签
+            answer = ans[1]              # 提取实际答案
 
+        # ---------------------- 步骤2：引用处理 ----------------------
+        # 如果启用了引用，而且模型没自己正确打引用标记，就调用retriever插入引用
         if knowledges and (prompt_config.get("quote", True) and kwargs.get("quote", True)):
-            idx = set([])
+            idx = set([])  # 引用的chunk索引集合
             normalized_answer = normalize_arabic_digits(answer) or ""
+
+            # 场景A：模型未显式给出引用标记，通过相似度反推
             if embd_mdl and not CITATION_MARKER_PATTERN.search(normalized_answer):
                 answer, idx = retriever.insert_citations(
                     answer,
                     [ck["content_ltks"] for ck in kbinfos["chunks"]],
                     [ck["vector"] for ck in kbinfos["chunks"]],
                     embd_mdl,
-                    tkweight=1 - dialog.vector_similarity_weight,
-                    vtweight=dialog.vector_similarity_weight,
+                    tkweight=1 - dialog.vector_similarity_weight,  # 文本相似度权重
+                    vtweight=dialog.vector_similarity_weight,       # 向量相似度权重
                     chunk_meta=kbinfos["chunks"],
                 )
+            # 场景B：模型已给出引用标记（如【1】【2】），直接提取
             else:
                 for match in CITATION_MARKER_PATTERN.finditer(normalized_answer):
                     i = int(match.group(1))
                     if i < len(kbinfos["chunks"]):
                         idx.add(i)
 
+            # 修复非标准引用格式（如编号错误、格式不一致等）
             answer, idx = repair_bad_citation_formats(answer, kbinfos, idx)
 
+            # 根据引用的chunk筛选相关文档
             idx = set([kbinfos["chunks"][int(i)]["doc_id"] for i in idx])
             recall_docs = [d for d in kbinfos["doc_aggs"] if d["doc_id"] in idx]
             if not recall_docs:
-                recall_docs = kbinfos["doc_aggs"]
+                recall_docs = kbinfos["doc_aggs"]  # 兜底：使用所有文档
             kbinfos["doc_aggs"] = recall_docs
 
+            # 构建引用结果（移除向量数据以减少传输大小）
             refs = deepcopy(kbinfos)
             for c in refs["chunks"]:
                 if c.get("vector"):
                     del c["vector"]
 
+        # ---------------------- 步骤3：错误处理 ----------------------
+        # API Key错误处理：提供友好的错误提示
         if answer.lower().find("invalid key") >= 0 or answer.lower().find("invalid api") >= 0:
             answer += " Please set LLM API-Key in 'User Setting -> Model providers -> API-Key'"
+
+        # ---------------------- 步骤4：性能统计 ----------------------
         finish_chat_ts = timer()
 
-        total_time_cost = (finish_chat_ts - chat_start_ts) * 1000
-        check_llm_time_cost = (check_llm_ts - chat_start_ts) * 1000
-        bind_embedding_time_cost = (bind_models_ts - check_llm_ts) * 1000
-        refine_question_time_cost = (refine_question_ts - bind_models_ts) * 1000
-        retrieval_time_cost = (retrieval_ts - refine_question_ts) * 1000
-        generate_result_time_cost = (finish_chat_ts - retrieval_ts) * 1000
+        # 计算各阶段耗时（毫秒）
+        total_time_cost = (finish_chat_ts - chat_start_ts) * 1000          # 总耗时
+        check_llm_time_cost = (check_llm_ts - chat_start_ts) * 1000       # LLM配置检查耗时
+        bind_embedding_time_cost = (bind_models_ts - check_llm_ts) * 1000  # 模型绑定耗时
+        refine_question_time_cost = (refine_question_ts - bind_models_ts) * 1000  # 问题增强耗时
+        retrieval_time_cost = (retrieval_ts - refine_question_ts) * 1000   # 检索耗时
+        generate_result_time_cost = (finish_chat_ts - retrieval_ts) * 1000 # 答案生成耗时
 
+        # 计算生成的Token数量
         tk_num = num_tokens_from_string(think + answer)
+
+        # 将查询内容添加到prompt中（用于调试）
         prompt += "\n\n### Query:\n%s" % " ".join(questions)
+
+        # 构建完整的性能统计信息
         prompt = (
             f"{prompt}\n\n"
             "## Time elapsed:\n"
             f"  - Total: {total_time_cost:.1f}ms\n"
             f"  - Check LLM: {check_llm_time_cost:.1f}ms\n"
-
             f"  - Bind models: {bind_embedding_time_cost:.1f}ms\n"
             f"  - Query refinement(LLM): {refine_question_time_cost:.1f}ms\n"
             f"  - Retrieval: {retrieval_time_cost:.1f}ms\n"
@@ -694,38 +1062,100 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             f"  - Token speed: {int(tk_num / (generate_result_time_cost / 1000.0))}/s"
         )
 
-        return {"answer": think + answer, "reference": refs, "prompt": re.sub(r"\n", "  \n", prompt), "created_at": time.time()}
+        # 返回处理后的结果
+        return {
+            "answer": think + answer,  # 含思考块的完整回答
+            "reference": refs,          # 引用信息
+            "prompt": re.sub(r"\n", "  \n", prompt),  # 格式化的prompt（用于显示）
+            "created_at": time.time()   # 创建时间戳
+        }
 
+    # ==================== 阶段9：LLM推理与响应生成 ====================
+
+    # ==================== 流式响应模式（SSE）====================
     if stream:
+        logging.debug("Using streaming response mode (SSE)")
+
+        # 根据LLM类型调用不同的流式接口
         if llm_type == "chat":
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf)
+            stream_iter = chat_mdl.async_chat_streamly_delta(
+                prompt + prompt4citation,  # 完整prompt（含引用提示）
+                msg[1:],                   # 用户消息（排除系统消息）
+                gen_conf                   # 生成配置
+            )
         else:
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf, images=image_files)
+            # image2text模型需要传递图片
+            stream_iter = chat_mdl.async_chat_streamly_delta(
+                prompt + prompt4citation,
+                msg[1:],
+                gen_conf,
+                images=image_files
+            )
+
         last_state = None
+        # 迭代处理流式输出（支持思考模式标记）
         async for kind, value, state in _stream_with_think_delta(stream_iter):
             last_state = state
             if kind == "marker":
+                # 思考模式标记处理
                 flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
-                yield {"answer": "", "reference": {}, "audio_binary": None, "final": False, **flags}
+                yield {
+                    "answer": "", 
+                    "reference": {}, 
+                    "audio_binary": None, 
+                    "final": False, 
+                    **flags
+                }
                 continue
-            yield {"answer": value, "reference": {}, "audio_binary": tts(tts_mdl, value), "final": False}
+            # 输出文本内容（带TTS语音）
+            yield {
+                "answer": value, 
+                "reference": {}, 
+                "audio_binary": tts(tts_mdl, value), 
+                "final": False
+            }
+
+        # 流式结束后，生成最终的引用增强答案
         full_answer = last_state.full_text if last_state else ""
         if full_answer:
             final = decorate_answer(thought + full_answer)
             final["final"] = True
-            final["audio_binary"] = None
+            final["audio_binary"] = None  # 最终响应不包含TTS（流式阶段已逐段发送）
             yield final
+
+    # ==================== 非流式响应模式 ====================
     else:
+        logging.debug("Using non-streaming response mode")
+
+        # 根据LLM类型调用不同的接口
         if llm_type == "chat":
-            answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf)
+            answer = await chat_mdl.async_chat(
+                prompt + prompt4citation,
+                msg[1:],
+                gen_conf
+            )
         else:
-            answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf, images=image_files)
+            # image2text模型需要传递图片
+            answer = await chat_mdl.async_chat(
+                prompt + prompt4citation,
+                msg[1:],
+                gen_conf,
+                images=image_files
+            )
+
+        # 日志记录对话内容
         user_content = msg[-1].get("content", "[content not available]")
         logging.debug("User: {}|Assistant: {}".format(user_content, answer))
+        # 答案后处理（添加引用、性能统计等）
         res = decorate_answer(answer)
+
+        # 添加TTS语音
         res["audio_binary"] = tts(tts_mdl, answer)
+
+        # 输出最终响应
         yield res
 
+    # 函数结束
     return
 
 
@@ -740,16 +1170,16 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
     else:
         doc_engine = "es"
 
-    # Construct the full table name
-    # For Elasticsearch: RAG-MedQA_{tenant_id} (kb_id is in WHERE clause)
-    # For Infinity: RAG-MedQA_{tenant_id}_{kb_id} (each KB has its own table)
+    # 构造完整表名。
+    # Elasticsearch: 使用基础索引名，kb_id 通过 WHERE 条件过滤。
+    # Infinity: 每个知识库独立成表，因此表名会额外拼上 kb_id。
     base_table = index_name()
     if doc_engine == "infinity" and kb_ids and len(kb_ids) == 1:
-        # Infinity: append kb_id to table name
+        # Infinity 模式下把 kb_id 追加到表名末尾。
         table_name = f"{base_table}_{kb_ids[0]}"
         logging.debug(f"use_sql: Using Infinity table name: {table_name}")
     else:
-        # Elasticsearch/OpenSearch: use base index name
+        # Elasticsearch/OpenSearch 使用基础索引名。
         table_name = base_table
         logging.debug(f"use_sql: Using ES/OS table name: {table_name}")
 
@@ -764,21 +1194,21 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
 
     def normalize_sql(sql):
         logging.debug(f"use_sql: Raw SQL from LLM: {repr(sql[:500])}")
-        # Remove think blocks if present (format: </think>...)
+        # 去掉思考块内容（如 `</think>` 前后的中间结果）。
         sql = re.sub(r"</think>\n.*?\n\s*", "", sql, flags=re.DOTALL)
         sql = re.sub(r"思考\n.*?\n", "", sql, flags=re.DOTALL)
-        # Remove markdown code blocks (```sql ... ```)
+        # 去掉 markdown 代码块包裹。
         sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
         sql = re.sub(r"```\s*$", "", sql, flags=re.IGNORECASE)
-        # Remove trailing semicolon that ES SQL parser doesn't like
+        # 去掉末尾分号，避免 ES SQL 解析器报错。
         return sql.rstrip().rstrip(';').strip()
 
     def add_kb_filter(sql):
-        # Add kb_id filter for ES/OS only (Infinity already has it in table name)
+        # 仅在 ES/OS 模式下追加 kb_id 过滤条件；Infinity 已经体现在表名里。
         if doc_engine == "infinity" or not kb_ids:
             return sql
 
-        # Build kb_filter: single KB or multiple KBs with OR
+        # 组装单知识库或多知识库过滤条件。
         if len(kb_ids) == 1:
             kb_filter = f"kb_id = '{kb_ids[0]}'"
         else:
@@ -800,9 +1230,9 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
             return False
         return bool(re.search(r"\bdataset\b|\btable\b|\bspreadsheet\b|\bexcel\b", q))
 
-    # Generate engine-specific SQL prompts
+    # 为不同文档引擎生成对应的 SQL prompt。
     if doc_engine == "infinity":
-        # Build Infinity prompts with JSON extraction context
+        # 为 Infinity 构造带 JSON 提取规则的 prompt。
         json_field_names = list(field_map.keys())
         row_count_override = (
             f"SELECT COUNT(*) AS rows FROM {table_name}"
@@ -838,7 +1268,7 @@ Write SQL using json_extract_string() with exact field names. Include doc_id, do
             question
         )
     elif doc_engine == "oceanbase":
-        # Build OceanBase prompts with JSON extraction context
+        # 为 OceanBase 构造带 JSON 提取规则的 prompt。
         json_field_names = list(field_map.keys())
         row_count_override = (
             f"SELECT COUNT(*) AS rows FROM {table_name}"

@@ -1,3 +1,8 @@
+"""聊天模型适配层。
+
+封装不同聊天模型供应商的请求、流式输出、重试和工具调用逻辑，
+是 `LLMBundle` 背后的核心实现之一。
+"""
 
 #
 import asyncio
@@ -59,7 +64,7 @@ def _apply_model_family_policies(
     sanitized_gen_conf = deepcopy(gen_conf) if gen_conf else {}
     sanitized_kwargs = dict(request_kwargs) if request_kwargs else {}
 
-    # Qwen3 family disables thinking by extra_body on non-stream chat requests.
+    # Qwen3 家族在非流式请求里通过 extra_body 控制是否开启思考模式。
     if "qwen3" in model_name_lower:
         sanitized_kwargs["extra_body"] = {"enable_thinking": False}
 
@@ -102,7 +107,7 @@ class Base(ABC):
         self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
         self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
         self.model_name = model_name
-        # Configure retry parameters
+        # 统一初始化重试参数，供不同提供商实现复用。
         self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
         self.base_delay = kwargs.get("retry_interval", float(os.environ.get("LLM_BASE_DELAY", 2.0)))
         self.max_rounds = kwargs.get("max_rounds", 5)
@@ -247,7 +252,7 @@ class Base(ABC):
 
     def _exceptions(self, e, attempt) -> str | None:
         logging.exception("OpenAI chat_with_tools")
-        # Classify the error
+        # 先把异常归类，再决定是否重试。
         error_code = self._classify_error(e)
         if attempt == self.max_retries:
             error_code = LLMErrorCode.ERROR_MAX_RETRIES
@@ -1024,15 +1029,15 @@ class GoogleChat(Base):
                 response["usage"]["input_tokens"] + response["usage"]["output_tokens"],
             )
 
-        # Gemini models with google-genai SDK
-        # Set default thinking_budget=0 if not specified
+        # Gemini 系列模型通过 `google-genai` SDK 调用。
+        # 如果调用方没有显式传入思考预算，则默认关闭额外思考开销。
         if "thinking_budget" not in gen_conf:
             gen_conf["thinking_budget"] = 0
 
         thinking_budget = gen_conf.pop("thinking_budget", 0)
         gen_conf = self._clean_conf(gen_conf)
 
-        # Build GenerateContentConfig
+        # 构造 google-genai 的生成配置对象。
         try:
             from google.genai.types import Content, GenerateContentConfig, Part, ThinkingConfig
         except ImportError as e:
@@ -1049,17 +1054,17 @@ class GoogleChat(Base):
         if "max_output_tokens" in gen_conf:
             config_dict["max_output_tokens"] = gen_conf["max_output_tokens"]
 
-        # Add ThinkingConfig
+        # 注入思考预算配置。
         config_dict["thinking_config"] = ThinkingConfig(thinking_budget=thinking_budget)
 
         config = GenerateContentConfig(**config_dict)
 
-        # Convert history to google-genai Content format
+        # 把历史消息转换成 google-genai 所需的 Content 结构。
         contents = []
         for item in history:
             if item["role"] == "system":
                 continue
-            # google-genai uses 'model' instead of 'assistant'
+            # google-genai 用 `model` 表示助手角色，而不是 `assistant`。
             role = "model" if item["role"] == "assistant" else item["role"]
             content = Content(
                 role=role,
@@ -1074,7 +1079,7 @@ class GoogleChat(Base):
         )
 
         ans = response.text
-        # Get token count from response
+        # 优先从响应元数据里读取官方返回的 token 用量。
         try:
             total_tokens = response.usage_metadata.total_token_count
         except Exception:
@@ -1107,18 +1112,18 @@ class GoogleChat(Base):
 
             yield total_tokens
         else:
-            # Gemini models with google-genai SDK
+            # Gemini 系列模型通过 `google-genai` SDK 调用。
             ans = ""
             total_tokens = 0
 
-            # Set default thinking_budget=0 if not specified
+            # 未显式指定时，默认关闭 thinking budget。
             if "thinking_budget" not in gen_conf:
                 gen_conf["thinking_budget"] = 0
 
             thinking_budget = gen_conf.pop("thinking_budget", 0)
             gen_conf = self._clean_conf(gen_conf)
 
-            # Build GenerateContentConfig
+            # 构造 google-genai 的生成配置对象。
             try:
                 from google.genai.types import Content, GenerateContentConfig, Part, ThinkingConfig
             except ImportError as e:
@@ -1135,15 +1140,15 @@ class GoogleChat(Base):
             if "max_output_tokens" in gen_conf:
                 config_dict["max_output_tokens"] = gen_conf["max_output_tokens"]
 
-            # Add ThinkingConfig
+            # 注入思考预算配置。
             config_dict["thinking_config"] = ThinkingConfig(thinking_budget=thinking_budget)
 
             config = GenerateContentConfig(**config_dict)
 
-            # Convert history to google-genai Content format
+            # 把历史消息转换成 google-genai 所需的 Content 结构。
             contents = []
             for item in history:
-                # google-genai uses 'model' instead of 'assistant'
+                # google-genai 用 `model` 表示助手角色，而不是 `assistant`。
                 role = "model" if item["role"] == "assistant" else item["role"]
                 content = Content(
                     role=role,
@@ -1239,7 +1244,7 @@ class LiteLLMBase(ABC):
         self.model_name = f"{self.prefix}{model_name}"
         self.api_key = key
         self.base_url = (base_url or FACTORY_DEFAULT_BASE_URL.get(self.provider, "")).rstrip("/")
-        # Configure retry parameters
+        # 配置统一的重试参数，供 LiteLLM 路径下的异常恢复逻辑使用。
         self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
         self.base_delay = kwargs.get("retry_interval", float(os.environ.get("LLM_BASE_DELAY", 2.0)))
         self.max_rounds = kwargs.get("max_rounds", 5)
@@ -1247,7 +1252,7 @@ class LiteLLMBase(ABC):
         self.tools = []
         self.toolcall_sessions = {}
 
-        # Factory specific fields
+        # 不同 LiteLLM provider 会额外要求不同的连接字段。
         if self.provider == SupportedLiteLLMProvider.OpenRouter:
             self.api_key = json.loads(key).get("api_key", "")
             self.provider_order = json.loads(key).get("provider_order", "")
@@ -1778,9 +1783,9 @@ class LiteLLMBase(ABC):
                 }
             )
 
-        # Ollama deployments commonly sit behind a reverse proxy that enforces
-        # Bearer auth. Ensure the Authorization header is set when an API key
-        # is provided, while respecting any user-supplied headers. #11350
+        # Ollama 部署经常会放在要求 Bearer 鉴权的反向代理后面。
+        # 如果配置了 API Key，就补齐 Authorization 头，避免代理层直接拒绝。
+        # 如果配置了 API Key，则自动补 Authorization，同时尊重用户自定义 header。#11350
         extra_headers = deepcopy(completion_args.get("extra_headers") or {})
         if self.provider == SupportedLiteLLMProvider.Ollama and self.api_key and "Authorization" not in extra_headers:
             extra_headers["Authorization"] = f"Bearer {self.api_key}"
@@ -1790,10 +1795,10 @@ class LiteLLMBase(ABC):
 
 class RAGconChat(Base):
     """
-    RAGcon Chat Provider - routes through LiteLLM proxy
-    
-    All model types are handled through a unified LiteLLM endpoint.
-    Default Base URL: https://connect.ragcon.com/v1
+    RAGcon Chat 提供商，实际通过 LiteLLM 代理统一转发。
+
+    这里把所有模型类型都路由到统一 LiteLLM 端点。
+    默认 Base URL: https://connect.ragcon.com/v1
     """
     _FACTORY_NAME = "RAGcon"
     

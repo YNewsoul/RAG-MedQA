@@ -1,3 +1,8 @@
-# Stub: cv_model not implemented in this fork
+"""计算机视觉模型占位模块。
+
+当前分支未保留独立 CV 模型实现，保留此文件仅用于兼容历史导入路径。
+"""
+
 class Base:
+    """视觉模型基类占位实现。"""
     pass

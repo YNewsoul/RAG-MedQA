@@ -1,3 +1,8 @@
+"""任务服务层。
+
+负责把文档解析拆成可执行任务、入 Redis 队列，并维护任务重试与复用逻辑。
+阅读建库执行链路时，这个文件很关键。
+"""
 
 import logging
 import os
@@ -24,12 +29,7 @@ CANVAS_DEBUG_DOC_ID = "dataflow_x"
 GRAPH_RAPTOR_FAKE_DOC_ID = "graph_raptor_x"
 
 def trim_header_by_lines(text: str, max_length) -> str:
-    # Trim header text to maximum length while preserving line breaks
-    # Args:
-    #     text: Input text to trim
-    #     max_length: Maximum allowed length
-    # Returns:
-    #     Trimmed text
+    # 在尽量保留换行结构的前提下，把头部文本裁剪到目标长度。
     len_text = len(text)
     if len_text <= max_length:
         return text
@@ -40,37 +40,13 @@ def trim_header_by_lines(text: str, max_length) -> str:
 
 
 class TaskService(CommonService):
-    """Service class for managing document processing tasks.
-
-    This class extends CommonService to provide specialized functionality for document
-    processing task management, including task creation, progress tracking, and chunk
-    management. It handles various document types (PDF, Excel, etc.) and manages their
-    processing lifecycle.
-
-    The class implements a robust task queue system with retry mechanisms and progress
-    tracking, supporting both synchronous and asynchronous task execution.
-
-    Attributes:
-        model: The Task model class for database operations.
-    """
+    """文档处理任务服务类。"""
     model = Task
 
     @classmethod
     @DB.connection_context()
     def get_task(cls, task_id, doc_ids=[]):
-        """Retrieve detailed task information by task ID.
-
-        This method fetches comprehensive task details including associated document,
-        dataset, and tenant information. It also handles task retry logic and
-        progress updates.
-
-        Args:
-            task_id (str): The unique identifier of the task to retrieve.
-
-        Returns:
-            dict: Task details dictionary containing all task information and related metadata.
-                 Returns None if task is not found or has exceeded retry limit.
-        """
+        """根据任务 ID 读取执行所需的完整上下文。"""
         doc_id = cls.model.doc_id
         if doc_id == CANVAS_DEBUG_DOC_ID and doc_ids:
             doc_id = doc_ids[0]
@@ -333,25 +309,7 @@ class TaskService(CommonService):
 
 
 def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
-    """Create and queue document processing tasks.
-
-    This function creates processing tasks for a document based on its type and configuration.
-    It handles different document types (PDF, Excel, etc.) differently and manages task
-    chunking and configuration. It also implements task reuse optimization by checking
-    for previously completed tasks.
-
-    Args:
-        doc (dict): Document dictionary containing metadata and configuration.
-        bucket (str): Storage bucket name where the document is stored.
-        name (str): File name of the document.
-        priority (int, optional): Priority level for task queueing (default is 0).
-
-    Note:
-        - For PDF documents, tasks are created per page range based on configuration
-        - For Excel documents, tasks are created per row range
-        - Task digests are calculated for optimization and reuse
-        - Previous task chunks may be reused if available
-    """
+    """按照文档类型切分任务，并把任务推入 Redis 队列。"""
 
     def new_task():
         return {
@@ -432,6 +390,7 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
     bulk_insert_into_db(Task, parse_task_array, True)
     DocumentService.begin2parse(doc["id"])
 
+    # 只有未完成的任务才真正进入队列；已复用的任务不会重复执行。
     unfinished_task_array = [task for task in parse_task_array if task["progress"] < 1.0]
     for unfinished_task in unfinished_task_array:
         assert REDIS_CONN.queue_product(
@@ -440,26 +399,7 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
 
 
 def reuse_prev_task_chunks(task: dict, prev_tasks: list[dict], chunking_config: dict):
-    """Attempt to reuse chunks from previous tasks for optimization.
-
-    This function checks if chunks from previously completed tasks can be reused for
-    the current task, which can significantly improve processing efficiency. It matches
-    tasks based on page ranges and configuration digests.
-
-    Args:
-        task (dict): Current task dictionary to potentially reuse chunks for.
-        prev_tasks (list[dict]): List of previous task dictionaries to check for reuse.
-        chunking_config (dict): Configuration dictionary for chunk processing.
-
-    Returns:
-        int: Number of chunks successfully reused. Returns 0 if no chunks could be reused.
-
-    Note:
-        Chunks can only be reused if:
-        - A previous task exists with matching page range and configuration digest
-        - The previous task was completed successfully (progress = 1.0)
-        - The previous task has valid chunk IDs
-    """
+    """尝试复用历史任务已完成的 chunk，避免重复解析。"""
     idx = 0
     while idx < len(prev_tasks):
         prev_task = prev_tasks[idx]

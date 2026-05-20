@@ -1,3 +1,8 @@
+"""MinerU PDF 解析器。
+
+负责把 PDF 交给 MinerU（CLI 或 API）处理，再转换成项目内部使用的
+`(sections, tables)` 结构。
+"""
 
 #
 
@@ -9,7 +14,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
+# 核心职责：调用 MinerU 并把输出转换成项目内部统一的 `(sections, tables)` 结构。
 class MinerUPdfParser:
     """Parse PDF files using MinerU and return RAG-MedQA (sections, tables) format.
 
@@ -35,7 +40,7 @@ class MinerUPdfParser:
         self.delete_output = bool(int(delete_output if delete_output is not None else 1))
 
     # ------------------------------------------------------------------
-    # Installation check
+    # 安装/可用性检查
     # ------------------------------------------------------------------
 
     def check_installation(self):
@@ -54,7 +59,7 @@ class MinerUPdfParser:
         return None
 
     # ------------------------------------------------------------------
-    # CLI mode
+    # CLI 模式
     # ------------------------------------------------------------------
 
     def _parse_via_cli(self, pdf_path: str, out_dir: str,
@@ -85,8 +90,8 @@ class MinerUPdfParser:
         if callback:
             callback(0.6, "MinerU: reading output …")
 
-        # Locate the generated markdown file.
-        # MinerU writes to: <out_dir>/<pdf_stem>/auto/<pdf_stem>.md
+        # 定位 MinerU 产出的 markdown 文件。
+        # 常见输出路径为：<out_dir>/<pdf_stem>/auto/<pdf_stem>.md
         pdf_stem = Path(pdf_path).stem
         candidates = [
             Path(out_dir) / pdf_stem / "auto" / f"{pdf_stem}.md",
@@ -97,7 +102,7 @@ class MinerUPdfParser:
             if p.exists():
                 return p.read_text(encoding="utf-8")
 
-        # Fallback: find any .md in the output tree
+        # 兜底：在输出目录树里找任意一个 markdown 文件。
         md_files = sorted(Path(out_dir).rglob("*.md"))
         if md_files:
             return md_files[0].read_text(encoding="utf-8")
@@ -107,7 +112,7 @@ class MinerUPdfParser:
         )
 
     # ------------------------------------------------------------------
-    # API mode
+    # API 模式
     # ------------------------------------------------------------------
 
     def _parse_via_api(self, binary: bytes, parse_method: str, callback) -> str:
@@ -143,7 +148,7 @@ class MinerUPdfParser:
                         val = data[field]
                         return val if isinstance(val, str) else str(val)
 
-                # Last resort: stringify the whole response
+                # 最后兜底：直接把整个响应对象转成字符串返回。
                 return str(data)
 
             except Exception as exc:

@@ -1,3 +1,20 @@
+"""向量嵌入模型适配层。
+
+这里把不同厂商/部署方式的向量模型封装成统一 `encode / encode_queries` 接口，
+方便上层检索逻辑直接调用。
+
+支持的嵌入模型：
+- OpenAI：text-embedding-ada-002
+- Azure OpenAI
+- 百度文心一言
+- 阿里云通义千问
+- 百川智能
+- LocalAI（本地部署）
+- TEI（文本嵌入接口服务）
+- 智谱AI
+- Ollama（本地部署）
+- HuggingFace（本地部署）
+"""
 
 import json
 import os
@@ -20,32 +37,55 @@ import base64
 
 
 class Base(ABC):
+    """向量嵌入模型抽象基类。
+    
+    定义所有嵌入模型必须实现的接口，确保上层代码可以统一调用。
+    """
     def __init__(self, key, model_name, **kwargs):
-        """
-        Constructor for abstract base class.
-        Parameters are accepted for interface consistency but are not stored.
-        Subclasses should implement their own initialization as needed.
-        """
+        """抽象基类构造函数，仅用于保持接口一致。"""
         pass
 
     def encode(self, texts: list):
+        """将文本列表编码为向量。
+        
+        Args:
+            texts: 文本列表
+            
+        Returns:
+            tuple: (向量数组, token计数)
+        """
         raise NotImplementedError("Please implement encode method!")
 
     def encode_queries(self, text: str):
+        """将单条查询文本编码为向量。
+        
+        Args:
+            text: 查询文本
+            
+        Returns:
+            tuple: (向量数组, token计数)
+        """
         raise NotImplementedError("Please implement encode method!")
 
 
 class BuiltinEmbed(Base):
+    """内置嵌入模型封装（基于TEI服务）。
+    
+    通过TEI（Text Embedding Inference）服务提供向量嵌入能力，
+    支持多种开源模型如Qwen3-Embedding、BGE-M3等。
+    """
     _FACTORY_NAME = "Builtin"
     MAX_TOKENS = {"Qwen/Qwen3-Embedding-0.6B": 30000, "BAAI/bge-m3": 8000, "BAAI/bge-small-en-v1.5": 500}
-    _model = None
-    _model_name = ""
-    _max_tokens = 500
-    _model_lock = threading.Lock()
+    _model = None      # 单例模型实例
+    _model_name = ""   # 模型名称
+    _max_tokens = 500  # 最大token数
+    _model_lock = threading.Lock()  # 线程锁（保证单例线程安全）
 
     def __init__(self, key, model_name, **kwargs):
+        """初始化内置嵌入模型。"""
         logging.info(f"Initialize BuiltinEmbed according to settings.EMBEDDING_CFG: {settings.EMBEDDING_CFG}")
         embedding_cfg = settings.EMBEDDING_CFG
+        # 懒加载：仅当使用TEI配置时才创建模型
         if not BuiltinEmbed._model and "tei-" in os.getenv("COMPOSE_PROFILES", ""):
             with BuiltinEmbed._model_lock:
                 BuiltinEmbed._model_name = settings.EMBEDDING_MDL
@@ -56,8 +96,9 @@ class BuiltinEmbed(Base):
         self._max_tokens = BuiltinEmbed._max_tokens
 
     def encode(self, texts: list):
+        """批量编码文本为向量。"""
         batch_size = 16
-        # TEI is able to auto truncate inputs according to https://github.com/huggingface/text-embeddings-inference.
+        # TEI 服务端会自动裁剪超长输入，因此这里只做批处理
         token_count = 0
         ress = None
         for i in range(0, len(texts), batch_size):
@@ -70,26 +111,44 @@ class BuiltinEmbed(Base):
         return ress, token_count
 
     def encode_queries(self, text: str):
+        """编码单条查询文本。"""
         return self._model.encode_queries(text)
 
 
 class OpenAIEmbed(Base):
+    """OpenAI 嵌入模型封装。
+    
+    使用 OpenAI API 提供向量嵌入服务，支持自定义 base_url（兼容代理）。
+    """
     _FACTORY_NAME = "OpenAI"
 
     def __init__(self, key, model_name="text-embedding-ada-002", base_url="https://api.openai.com/v1"):
+        """初始化 OpenAI 嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称（默认text-embedding-ada-002）
+            base_url: API基础URL
+        """
         if not base_url:
             base_url = "https://api.openai.com/v1"
         self.client = OpenAI(api_key=key, base_url=base_url)
         self.model_name = model_name
 
     def encode(self, texts: list):
-        # OpenAI requires batch size <=16
+        """批量编码文本为向量。
+        
+        OpenAI embedding 接口单批次不宜过大，这里保守控制在16条。
+        """
         batch_size = 16
-        texts = [truncate(t, 8191) for t in texts]
+        texts = [truncate(t, 8191) for t in texts]  # 截断到最大长度
         ress = []
         total_tokens = 0
         for i in range(0, len(texts), batch_size):
-            res = self.client.embeddings.create(input=texts[i : i + batch_size], model=self.model_name, encoding_format="float", extra_body={"drop_params": True})
+            res = self.client.embeddings.create(input=texts[i : i + batch_size], 
+                                               model=self.model_name, 
+                                               encoding_format="float", 
+                                               extra_body={"drop_params": True})
             try:
                 ress.extend([d.embedding for d in res.data])
                 total_tokens += total_token_count_from_response(res)
@@ -99,7 +158,11 @@ class OpenAIEmbed(Base):
         return np.array(ress), total_tokens
 
     def encode_queries(self, text):
-        res = self.client.embeddings.create(input=[truncate(text, 8191)], model=self.model_name, encoding_format="float", extra_body={"drop_params": True})
+        """编码单条查询文本。"""
+        res = self.client.embeddings.create(input=[truncate(text, 8191)], 
+                                           model=self.model_name, 
+                                           encoding_format="float", 
+                                           extra_body={"drop_params": True})
         try:
             return np.array(res.data[0].embedding), total_token_count_from_response(res)
         except Exception as _e:
@@ -108,9 +171,20 @@ class OpenAIEmbed(Base):
 
 
 class LocalAIEmbed(Base):
+    """LocalAI 嵌入模型封装。
+    
+    支持 LmStudio 等本地部署的嵌入模型，使用 OpenAI 兼容接口。
+    """
     _FACTORY_NAME = "LocalAI"
 
     def __init__(self, key, model_name, base_url):
+        """初始化 LocalAI 嵌入客户端。
+        
+        Args:
+            key: API密钥（本地模型通常不需要）
+            model_name: 模型名称
+            base_url: 本地服务URL
+        """
         if not base_url:
             raise ValueError("Local embedding model url cannot be None")
         base_url = urljoin(base_url, "v1")
@@ -118,6 +192,10 @@ class LocalAIEmbed(Base):
         self.model_name = model_name.split("___")[0]
 
     def encode(self, texts: list):
+        """批量编码文本为向量。
+        
+        LmStudio 本地 embedding 通常不返回可靠 token 用量，使用固定占位值1024。
+        """
         batch_size = 16
         ress = []
         for i in range(0, len(texts), batch_size):
@@ -127,18 +205,30 @@ class LocalAIEmbed(Base):
             except Exception as _e:
                 log_exception(_e, res)
                 raise Exception(f"Error: {res}")
-        # local embedding for LmStudio donot count tokens
+        # LmStudio 本地 embedding 通常不返回可靠 token 用量，这里使用固定占位值
         return np.array(ress), 1024
 
     def encode_queries(self, text):
+        """编码单条查询文本。"""
         embds, cnt = self.encode([text])
         return np.array(embds[0]), cnt
 
 
 class AzureEmbed(OpenAIEmbed):
+    """Azure OpenAI 嵌入模型封装。
+    
+    继承自 OpenAIEmbed，适配 Azure OpenAI 服务。
+    """
     _FACTORY_NAME = "Azure-OpenAI"
 
     def __init__(self, key, model_name, **kwargs):
+        """初始化 Azure OpenAI 嵌入客户端。
+        
+        Args:
+            key: JSON格式的密钥（包含api_key和api_version）
+            model_name: 模型名称
+            kwargs: 包含base_url等参数
+        """
         from openai.lib.azure import AzureOpenAI
 
         api_key = json.loads(key).get("api_key", "")
@@ -148,37 +238,69 @@ class AzureEmbed(OpenAIEmbed):
 
 
 class BaiChuanEmbed(OpenAIEmbed):
+    """百川智能嵌入模型封装。
+    
+    继承自 OpenAIEmbed，使用 OpenAI 兼容接口调用百川嵌入服务。
+    """
     _FACTORY_NAME = "BaiChuan"
 
     def __init__(self, key, model_name="Baichuan-Text-Embedding", base_url="https://api.baichuan-ai.com/v1"):
+        """初始化百川嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称
+            base_url: API基础URL
+        """
         if not base_url:
             base_url = "https://api.baichuan-ai.com/v1"
         super().__init__(key, model_name, base_url)
 
 
 class QWenEmbed(Base):
+    """阿里云通义千问嵌入模型封装。
+    
+    使用阿里云 DashScope SDK 调用通义千问嵌入服务。
+    """
     _FACTORY_NAME = "Tongyi-Qianwen"
 
     def __init__(self, key, model_name="text_embedding_v2", **kwargs):
+        """初始化通义千问嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称（默认text_embedding_v2）
+        """
         self.key = key
         self.model_name = model_name
 
     def encode(self, texts: list):
+        """批量编码文本为向量。
+        
+        支持重试机制，最多重试5次，每次间隔10秒。
+        """
         import time
-
         import dashscope
 
-        batch_size = 4
+        batch_size = 4  # 千问嵌入接口批次较小
         res = []
         token_count = 0
         texts = [truncate(t, 2048) for t in texts]
         for i in range(0, len(texts), batch_size):
             retry_max = 5
-            resp = dashscope.TextEmbedding.call(model=self.model_name, input=texts[i : i + batch_size], api_key=self.key, text_type="document")
+            resp = dashscope.TextEmbedding.call(model=self.model_name, 
+                                               input=texts[i : i + batch_size], 
+                                               api_key=self.key, 
+                                               text_type="document")
+            # 重试机制
             while (resp["output"] is None or resp["output"].get("embeddings") is None) and retry_max > 0:
                 time.sleep(10)
-                resp = dashscope.TextEmbedding.call(model=self.model_name, input=texts[i : i + batch_size], api_key=self.key, text_type="document")
+                resp = dashscope.TextEmbedding.call(model=self.model_name, 
+                                                   input=texts[i : i + batch_size], 
+                                                   api_key=self.key, 
+                                                   text_type="document")
                 retry_max -= 1
+            # 重试失败处理
             if retry_max == 0 and (resp["output"] is None or resp["output"].get("embeddings") is None):
                 if resp.get("message"):
                     log_exception(ValueError(f"Retry_max reached, calling embedding model failed: {resp['message']}"))
@@ -197,6 +319,7 @@ class QWenEmbed(Base):
         return np.array(res), token_count
 
     def encode_queries(self, text):
+        """编码单条查询文本（使用query类型）。"""
         resp = dashscope.TextEmbedding.call(model=self.model_name, input=text[:2048], api_key=self.key, text_type="query")
         try:
             return np.array(resp["output"]["embeddings"][0]["embedding"]), total_token_count_from_response(resp)
@@ -206,13 +329,29 @@ class QWenEmbed(Base):
 
 
 class ZhipuEmbed(Base):
+    """智谱AI嵌入模型封装。
+    
+    使用智谱AI官方SDK调用嵌入服务，支持embedding-2和embedding-3模型。
+    """
     _FACTORY_NAME = "ZHIPU-AI"
 
     def __init__(self, key, model_name="embedding-2", **kwargs):
+        """初始化智谱AI嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称（embedding-2或embedding-3）
+        """
         self.client = ZhipuAI(api_key=key)
         self.model_name = model_name
 
     def encode(self, texts: list):
+        """批量编码文本为向量。
+        
+        根据模型类型设置不同的最大长度：
+        - embedding-2: 512 tokens
+        - embedding-3: 3072 tokens
+        """
         arr = []
         tks_num = 0
         MAX_LEN = -1
@@ -234,6 +373,7 @@ class ZhipuEmbed(Base):
         return np.array(arr), tks_num
 
     def encode_queries(self, text):
+        """编码单条查询文本。"""
         res = self.client.embeddings.create(input=text, model=self.model_name)
         try:
             return np.array(res.data[0].embedding), total_token_count_from_response(res)
@@ -243,20 +383,36 @@ class ZhipuEmbed(Base):
 
 
 class OllamaEmbed(Base):
+    """Ollama 本地嵌入模型封装。
+    
+    使用 Ollama 客户端调用本地部署的嵌入模型，支持 API 密钥认证。
+    """
     _FACTORY_NAME = "Ollama"
 
-    _special_tokens = ["<|endoftext|>"]
+    _special_tokens = ["<|endoftext|>"]  # 需要移除的特殊token
 
     def __init__(self, key, model_name, **kwargs):
+        """初始化 Ollama 嵌入客户端。
+        
+        Args:
+            key: API密钥（可选）
+            model_name: 模型名称
+            kwargs: 包含base_url和ollama_keep_alive等参数
+        """
         self.client = Client(host=kwargs["base_url"]) if not key or key == "x" else Client(host=kwargs["base_url"], headers={"Authorization": f"Bearer {key}"})
         self.model_name = model_name
         self.keep_alive = kwargs.get("ollama_keep_alive", int(os.environ.get("OLLAMA_KEEP_ALIVE", -1)))
 
     def encode(self, texts: list):
+        """批量编码文本为向量。
+        
+        先移除 Ollama 侧可能误处理的特殊 token，再发起请求。
+        Ollama 本地模型不返回可靠 token 计数，使用固定值128。
+        """
         arr = []
         tks_num = 0
         for txt in texts:
-            # remove special tokens if they exist base on regex in one request
+            # 先移除 Ollama 侧可能误处理的特殊 token，再发起请求
             for token in OllamaEmbed._special_tokens:
                 txt = txt.replace(token, "")
             res = self.client.embeddings(prompt=txt, model=self.model_name, options={"use_mmap": True}, keep_alive=self.keep_alive)
@@ -269,7 +425,10 @@ class OllamaEmbed(Base):
         return np.array(arr), tks_num
 
     def encode_queries(self, text):
-        # remove special tokens if they exist
+        """编码单条查询文本。
+        
+        查询向量也做同样的清洗，保持和文档向量处理方式一致。
+        """
         for token in OllamaEmbed._special_tokens:
             text = text.replace(token, "")
         res = self.client.embeddings(prompt=text, model=self.model_name, options={"use_mmap": True}, keep_alive=self.keep_alive)
@@ -281,14 +440,26 @@ class OllamaEmbed(Base):
 
 
 class XinferenceEmbed(Base):
+    """Xinference 嵌入模型封装。
+    
+    Xinference 是一个本地LLM推理框架，使用 OpenAI 兼容接口。
+    """
     _FACTORY_NAME = "Xinference"
 
     def __init__(self, key, model_name="", base_url=""):
+        """初始化 Xinference 嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称
+            base_url: Xinference服务URL
+        """
         base_url = urljoin(base_url, "v1")
         self.client = OpenAI(api_key=key, base_url=base_url)
         self.model_name = model_name
 
     def encode(self, texts: list):
+        """批量编码文本为向量。"""
         batch_size = 16
         ress = []
         total_tokens = 0
@@ -304,6 +475,7 @@ class XinferenceEmbed(Base):
         return np.array(ress), total_tokens
 
     def encode_queries(self, text):
+        """编码单条查询文本。"""
         res = None
         try:
             res = self.client.embeddings.create(input=[text], model=self.model_name)
@@ -314,13 +486,24 @@ class XinferenceEmbed(Base):
 
 
 class YoudaoEmbed(Base):
+    """有道嵌入模型封装。
+    
+    使用有道云服务提供向量嵌入能力，客户端通过类变量共享。
+    """
     _FACTORY_NAME = "Youdao"
-    _client = None
+    _client = None  # 共享客户端实例
 
     def __init__(self, key=None, model_name="maidalun1020/bce-embedding-base_v1", **kwargs):
+        """初始化有道嵌入客户端。
+        
+        Args:
+            key: API密钥（可选）
+            model_name: 模型名称
+        """
         pass
 
     def encode(self, texts: list):
+        """批量编码文本为向量。"""
         batch_size = 10
         res = []
         token_count = 0
@@ -332,19 +515,39 @@ class YoudaoEmbed(Base):
         return np.array(res), token_count
 
     def encode_queries(self, text):
+        """编码单条查询文本。"""
         embds = YoudaoEmbed._client.encode([text])
         return np.array(embds[0]), num_tokens_from_string(text)
 
 
 class JinaMultiVecEmbed(Base):
+    """Jina AI 多模态嵌入模型封装。
+    
+    支持文本和图片嵌入，使用 Jina AI 云服务。
+    """
     _FACTORY_NAME = "Jina"
 
     def __init__(self, key, model_name="jina-embeddings-v4", base_url="https://api.jina.ai/v1/embeddings"):
+        """初始化 Jina 嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称（默认jina-embeddings-v4）
+            base_url: API基础URL
+        """
         self.base_url = "https://api.jina.ai/v1/embeddings"
         self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         self.model_name = model_name
 
     def encode(self, texts: list[str | bytes], task="retrieval.passage"):
+        """批量编码文本或图片为向量。
+        
+        支持文本和图片（base64编码）输入，v4模型支持多向量返回。
+        
+        Args:
+            texts: 文本或图片字节列表
+            task: 任务类型（retrieval.passage/retrieval.query等）
+        """
         batch_size = 16
         ress = []
         token_count = 0
@@ -353,18 +556,20 @@ class JinaMultiVecEmbed(Base):
             if isinstance(text, str):
                 input.append({"text": text})
             elif isinstance(text, bytes):
+                # 处理图片数据
                 img_b64s = None
                 try:
                     base64.b64decode(text, validate=True)
                     img_b64s = text.decode("utf8")
                 except Exception:
                     img_b64s = base64.b64encode(text).decode("utf8")
-                input.append({"image": img_b64s})  # base64 encoded image
+                input.append({"image": img_b64s})
         for i in range(0, len(texts), batch_size):
             data = {"model": self.model_name, "input": input[i : i + batch_size]}
+            # v4模型支持多向量
             if "v4" in self.model_name:
                 data["return_multivector"] = True
-
+            # v3/v4支持任务类型和自动截断
             if "v3" in self.model_name or "v4" in self.model_name:
                 data["task"] = task
                 data["truncate"] = True
@@ -373,16 +578,13 @@ class JinaMultiVecEmbed(Base):
             try:
                 res = response.json()
                 for d in res["data"]:
-                    if data.get("return_multivector", False):  # v4
+                    if data.get("return_multivector", False):  # v4模型返回多向量
                         token_embs = np.asarray(d["embeddings"], dtype=np.float32)
-                        chunk_emb = token_embs.mean(axis=0)
-
+                        chunk_emb = token_embs.mean(axis=0)  # 取平均作为chunk向量
                     else:
-                        # v2/v3
+                        # 兼容 v2 / v3 两类返回格式
                         chunk_emb = np.asarray(d["embedding"], dtype=np.float32)
-
                     ress.append(chunk_emb)
-
                 token_count += total_token_count_from_response(res)
             except Exception as _e:
                 log_exception(_e, response)
@@ -390,20 +592,35 @@ class JinaMultiVecEmbed(Base):
         return np.array(ress), token_count
 
     def encode_queries(self, text):
+        """编码单条查询文本（使用retrieval.query任务）。"""
         embds, cnt = self.encode([text], task="retrieval.query")
         return np.array(embds[0]), cnt
 
 
 class MistralEmbed(Base):
+    """Mistral AI 嵌入模型封装。
+    
+    使用 Mistral AI 官方SDK调用嵌入服务，支持重试机制。
+    """
     _FACTORY_NAME = "Mistral"
 
     def __init__(self, key, model_name="mistral-embed", base_url=None):
+        """初始化 Mistral 嵌入客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称（默认mistral-embed）
+            base_url: API基础URL（可选）
+        """
         from mistralai.client import MistralClient
-
         self.client = MistralClient(api_key=key)
         self.model_name = model_name
 
     def encode(self, texts: list):
+        """批量编码文本为向量。
+        
+        支持重试机制，最多重试5次，每次延迟20-60秒（随机）。
+        """
         import time
         import random
 
@@ -428,6 +645,7 @@ class MistralEmbed(Base):
         return np.array(ress), token_count
 
     def encode_queries(self, text):
+        """编码单条查询文本（支持重试）。"""
         import time
         import random
 
@@ -450,13 +668,12 @@ class BedrockEmbed(Base):
     def __init__(self, key, model_name, **kwargs):
         import boto3
 
-        # `key` protocol (backend stores as JSON string in `api_key`):
-        # - Must decode into a dict.
-        # - Required: `auth_mode`, `bedrock_region`.
-        # - Supported auth modes:
-        #   - "access_key_secret": requires `bedrock_ak` + `bedrock_sk`.
-        #   - "iam_role": requires `aws_role_arn` and assumes role via STS.
-        #   - else: treated as "assume_role" (default AWS credential chain).
+        # `key` 字段实际存的是 JSON 字符串，需要先解码成 dict。
+        # 必填项：`auth_mode`、`bedrock_region`。
+        # 支持三种认证模式：
+        # - `access_key_secret`：要求同时提供 `bedrock_ak` 和 `bedrock_sk`
+        # - `iam_role`：要求提供 `aws_role_arn`，通过 STS 假设角色
+        # - 其他情况：视作 `assume_role`，走默认 AWS 凭证链
         key = json.loads(key)
         mode = key.get("auth_mode")
         if not mode:
@@ -576,7 +793,7 @@ class GeminiEmbed(Base):
         try:
             return self.types.EmbedContentConfig(task_type=task_type, title="Embedding of single string")
         except TypeError:
-            # Compatible with SDK versions that do not accept title in embed config.
+        # 有些旧版 SDK 不接受 `title` 字段，这里做一次兼容降级。
             return self.types.EmbedContentConfig(task_type=task_type)
 
     def encode(self, texts: list):

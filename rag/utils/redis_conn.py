@@ -1,3 +1,8 @@
+"""Redis / Valkey 连接封装。
+
+负责缓存、分布式锁、队列、令牌桶限流等功能，是任务调度和进度刷新链路的
+关键基础设施之一。
+"""
 
 #
 
@@ -22,6 +27,7 @@ except Exception:
 
 
 class RedisMsg:
+    """对 Redis Stream 消息做的轻量包装。"""
     def __init__(self, consumer, queue_name, group_name, msg_id, message):
         self.__consumer = consumer
         self.__queue_name = queue_name
@@ -30,6 +36,7 @@ class RedisMsg:
         self.__message = json.loads(message["message"])
 
     def ack(self):
+        """确认消息已消费。"""
         try:
             self.__consumer.xack(self.__queue_name, self.__group_name, self.__msg_id)
             return True
@@ -38,9 +45,11 @@ class RedisMsg:
         return False
 
     def get_message(self):
+        """返回反序列化后的消息体。"""
         return self.__message
 
     def get_msg_id(self):
+        """返回消息 ID。"""
         return self.__msg_id
 
 
@@ -104,12 +113,14 @@ class RedisDB:
         self.__open__()
 
     def register_scripts(self) -> None:
+        """把 Lua 脚本注册到当前 Redis 连接。"""
         cls = self.__class__
         client = self.REDIS
         cls.lua_delete_if_equal = client.register_script(cls.LUA_DELETE_IF_EQUAL_SCRIPT)
         cls.lua_token_bucket = client.register_script(cls.LUA_TOKEN_BUCKET_SCRIPT)
 
     def __open__(self):
+        """根据配置建立 Redis 连接。"""
         try:
             conn_params = {
                 "host": self.config["host"].split(":")[0],
@@ -132,6 +143,7 @@ class RedisDB:
         return self.REDIS
 
     def health(self):
+        """做一次最小读写测试，检查 Redis 是否健康。"""
         self.REDIS.ping()
         a, b = "xx", "yy"
         self.REDIS.set(a, b, 3)
@@ -141,6 +153,7 @@ class RedisDB:
         return False
 
     def info(self):
+        """返回常用 Redis 运行时信息。"""
         info = self.REDIS.info()
         return {
             'redis_version': info["redis_version"],
@@ -155,6 +168,7 @@ class RedisDB:
         }
 
     def is_alive(self):
+        """判断连接对象是否已经建立。"""
         return self.REDIS is not None
 
     def exist(self, k):
@@ -282,19 +296,19 @@ class RedisDB:
         redis_key = f"{key_prefix}:{namespace}"
 
         try:
-            # Use pipeline for atomicity
+            # 使用 pipeline，把这组操作尽量放在同一个原子批次里执行。
             pipe = self.REDIS.pipeline()
 
-            # Check if key exists
+            # 先判断 key 是否已经存在。
             pipe.exists(redis_key)
 
-            # Get/Increment
+            # 根据是否要求最小值，走“读取后修正”或直接自增。
             if ensure_minimum is not None:
-                # Ensure minimum value
+                # 如果业务要求一个最小起始值，就先按最小值校正。
                 pipe.get(redis_key)
                 results = pipe.execute()
 
-                if results[0] == 0:  # Key doesn't exist
+                if results[0] == 0:  # key 还不存在
                     start_id = max(1, ensure_minimum)
                     pipe.set(redis_key, start_id)
                     pipe.execute()
@@ -306,10 +320,10 @@ class RedisDB:
                         pipe.execute()
                         return ensure_minimum
 
-            # Increment operation
+            # 执行自增。
             next_id = self.REDIS.incrby(redis_key, increment)
 
-            # If it's the first time, set a reasonable initial value
+            # 如果是第一次生成，则补一个更合理的初始值。
             if next_id == increment:
                 self.REDIS.set(redis_key, 1 + increment)
                 return 1 + increment
@@ -323,34 +337,28 @@ class RedisDB:
 
     def get_or_create_secret_key(self, key_name: str, new_value: str) -> str:
         """
-        Atomically get an existing key or create a new one.
+        原子地获取一个已有密钥；如果不存在，就创建并返回它。
 
-        This method guarantees that across multiple concurrent calls, only one
-        key will be created and all callers will receive the same key.
-
-        Returns:
-            The secret key string
-
-        Raises:
-            redis.RedisError: If Redis operations fail
+        这个方法保证在并发调用场景下，最终只会有一个值真正写入 Redis，
+        其余调用方都会拿到同一个结果。
         """
-        # First, try to get the existing key
+        # 先尝试直接读取已有值。
         existing_value = self.REDIS.get(key_name)
         if existing_value is not None:
             logging.debug("Retrieved existing key from Redis")
             return existing_value
 
-        # Use SETNX to atomically set the key only if it doesn't exist
-        # SETNX returns True if the key was set, False if it already existed
+        # 用 SETNX 做“仅当不存在时才写入”，这是这里的并发保护核心。
+        # SETNX 返回 True 表示本次成功写入，False 表示别的请求已经先写了。
         if self.REDIS.setnx(key_name, new_value):
             logging.info("Successfully created new secret key in Redis")
             return new_value
 
-        # SETNX failed, meaning another process created the key concurrently
-        # Retrieve and return that key
+        # 如果 SETNX 失败，说明并发期间已经有别的进程创建了这个 key。
+        # 这时再读一次，把最终落库的值返回给调用方。
         final_key = self.REDIS.get(key_name)
         if final_key is None:
-            # This should rarely happen, but retry if it does
+            # 极少数情况下可能刚好遇到竞争窗口，再递归重试一次。
             logging.warning("Key disappeared during concurrent access, retrying...")
             return self.get_or_create_secret_key(key_name, new_value)
 

@@ -1,3 +1,8 @@
-# Stub: tts_model not implemented in this fork
+"""文本转语音模型占位模块。
+
+当前分支未保留 TTS 具体实现，仅保留导入兼容所需的最小结构。
+"""
+
 class Base:
+    """TTS 模型基类占位实现。"""
     pass

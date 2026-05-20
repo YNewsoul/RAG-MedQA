@@ -1,3 +1,8 @@
+"""知识库服务层。
+
+负责知识库的创建、列表、权限和解析配置管理。
+学习建库链路时，可以把它看作“知识库元数据入口”。
+"""
 
 from datetime import datetime
 
@@ -16,51 +21,13 @@ from api.utils.api_utils import get_parser_config, get_data_error_result
 
 
 class KnowledgebaseService(CommonService):
-    """Service class for managing dataset operations.
-
-    This class extends CommonService to provide specialized functionality for dataset
-    management, including document parsing status tracking, access control, and configuration
-    management. It handles operations such as listing, creating, updating, and deleting
-    knowledge bases, as well as managing their associated documents and permissions.
-
-    The class implements a comprehensive set of methods for:
-    - Document parsing status verification
-    - Knowledge base access control
-    - Parser configuration management
-    - Tenant-based dataset organization
-
-    Attributes:
-        model: The Knowledgebase model class for database operations.
-    """
+    """知识库服务类，封装知识库元数据和解析配置相关操作。"""
     model = Knowledgebase
 
     @classmethod
     @DB.connection_context()
     def accessible4deletion(cls, kb_id, user_id):
-        """Check if a dataset can be deleted by a specific user.
-
-        This method verifies whether a user has permission to delete a dataset
-        by checking if they are the creator of that dataset.
-
-        Args:
-            kb_id (str): The unique identifier of the dataset to check.
-            user_id (str): The unique identifier of the user attempting the deletion.
-
-        Returns:
-            bool: True if the user has permission to delete the dataset,
-                  False if the user doesn't have permission or the dataset doesn't exist.
-
-        Example:
-            >>> KnowledgebaseService.accessible4deletion("kb123", "user456")
-            True
-
-        Note:
-            - This method only checks creator permissions
-            - A return value of False can mean either:
-                1. The dataset doesn't exist
-                2. The user is not the creator of the dataset
-        """
-        # Check if a dataset can be deleted by a user
+        """检查指定用户是否有权删除某个知识库。"""
         docs = cls.model.select(
             cls.model.id).where(cls.model.id == kb_id, cls.model.created_by == user_id).paginate(0, 1)
         docs = docs.dicts()
@@ -71,32 +38,23 @@ class KnowledgebaseService(CommonService):
     @classmethod
     @DB.connection_context()
     def is_parsed_done(cls, kb_id):
-        # Check if all documents in the dataset have completed parsing
-        #
-        # Args:
-        #     kb_id: Knowledge base ID
-        #
-        # Returns:
-        #     If all documents are parsed successfully, returns (True, None)
-        #     If any document is not fully parsed, returns (False, error_message)
+        # 检查知识库下所有文档是否都已完成解析，适合在开聊前做守卫判断。
         from common.constants import TaskStatus
         from api.db.services.document_service import DocumentService
 
-        # Get dataset information
+        # 先拿知识库本身的信息。
         kbs = cls.query(id=kb_id)
         if not kbs:
             return False, "Knowledge base not found"
         kb = kbs[0]
 
-        # Get all documents in the dataset
+        # 再读取知识库下的全部文档状态。
         docs, _ = DocumentService.get_by_kb_id(kb_id, 1, 1000, "create_time", True, "", [], [])
 
-        # Check parsing status of each document
+        # 只要还有文档未处理完成，就不允许进入问答阶段。
         for doc in docs:
-            # If document is being parsed, don't allow chat creation
             if doc['run'] == TaskStatus.RUNNING.value or doc['run'] == TaskStatus.CANCEL.value or doc['run'] == TaskStatus.FAIL.value:
                 return False, f"Document '{doc['name']}' in dataset '{kb.name}' is still being parsed. Please wait until all documents are parsed before starting a chat."
-            # If document is not yet parsed and has no chunks, don't allow chat creation
             if doc['run'] == TaskStatus.UNSTART.value and doc['chunk_num'] == 0:
                 return False, f"Document '{doc['name']}' in dataset '{kb.name}' has not been parsed yet. Please parse all documents before starting a chat."
 
@@ -105,11 +63,7 @@ class KnowledgebaseService(CommonService):
     @classmethod
     @DB.connection_context()
     def list_documents_by_ids(cls, kb_ids):
-        # Get document IDs associated with given dataset IDs
-        # Args:
-        #     kb_ids: List of dataset IDs
-        # Returns:
-        #     List of document IDs
+        # 根据知识库 ID 列表，反查关联的文档 ID 列表。
         doc_ids = cls.model.select(Document.id.alias("document_id")).join(Document, on=(cls.model.id == Document.kb_id)).where(
             cls.model.id.in_(kb_ids)
         )

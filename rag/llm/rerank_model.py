@@ -1,3 +1,15 @@
+"""重排模型适配层。
+
+把不同厂商的重排模型统一成 `similarity(query, texts)` 接口，
+供检索阶段的二次排序直接调用。
+
+支持的重排模型：
+- Jina Rerank：Jina AI 提供的重排服务
+- Xinference Rerank：Xinference 本地部署的重排模型
+- LocalAI Rerank：LocalAI/LmStudio 本地部署的重排模型
+- NVIDIA Rerank：NVIDIA AI API 提供的重排服务
+- LM-Studio Rerank：预留接口（暂未实现）
+"""
 
 import json
 from abc import ABC
@@ -12,21 +24,35 @@ from common.log_utils import log_exception
 from common.token_utils import num_tokens_from_string, truncate, total_token_count_from_response
 
 class Base(ABC):
+    """重排模型抽象基类。
+    
+    定义所有重排模型必须实现的接口，提供分数归一化辅助方法。
+    """
     def __init__(self, key, model_name, **kwargs):
-        """
-        Abstract base class constructor.
-        Parameters are not stored; initialization is left to subclasses.
-        """
+        """抽象基类构造函数，仅用于保持接口一致。"""
         pass
 
     def similarity(self, query: str, texts: list):
+        """计算查询与文本列表的相似度分数。
+        
+        Args:
+            query: 查询文本
+            texts: 待排序的文本列表
+            
+        Returns:
+            tuple: (相似度分数数组, token计数)
+        """
         raise NotImplementedError("Please implement encode method!")
 
     @staticmethod
     def _normalize_rank(rank: np.ndarray) -> np.ndarray:
-        """
-        Normalize rank values to the range 0 to 1.
-        Avoids division by zero if all ranks are identical.
+        """把重排分数归一化到 0~1，避免量纲不一致。
+        
+        Args:
+            rank: 原始分数数组
+            
+        Returns:
+            np.ndarray: 归一化后的分数数组
         """
         min_rank = np.min(rank)
         max_rank = np.max(rank)
@@ -40,14 +66,26 @@ class Base(ABC):
 
 
 class JinaRerank(Base):
+    """Jina AI 重排模型封装。
+    
+    使用 Jina AI 云服务提供重排能力，支持多语言。
+    """
     _FACTORY_NAME = "Jina"
 
     def __init__(self, key, model_name="jina-reranker-v2-base-multilingual", base_url="https://api.jina.ai/v1/rerank"):
+        """初始化 Jina 重排客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称（默认jina-reranker-v2-base-multilingual）
+            base_url: API基础URL
+        """
         self.base_url = "https://api.jina.ai/v1/rerank"
         self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         self.model_name = model_name
 
     def similarity(self, query: str, texts: list):
+        """计算查询与文本列表的相似度。"""
         texts = [truncate(t, 8196) for t in texts]
         data = {"model": self.model_name, "query": query, "documents": texts, "top_n": len(texts)}
         res = requests.post(self.base_url, headers=self.headers, json=data).json()
@@ -61,9 +99,21 @@ class JinaRerank(Base):
 
 
 class XInferenceRerank(Base):
+    """Xinference 重排模型封装。
+    
+    使用 Xinference 本地部署的重排模型，支持 OpenAI 兼容接口。
+    """
     _FACTORY_NAME = "Xinference"
 
     def __init__(self, key="x", model_name="", base_url=""):
+        """初始化 Xinference 重排客户端。
+        
+        Args:
+            key: API密钥（可选）
+            model_name: 模型名称
+            base_url: Xinference服务URL
+        """
+        # 确保URL正确
         if base_url.find("/v1") == -1:
             base_url = urljoin(base_url, "/v1/rerank")
         if base_url.find("/rerank") == -1:
@@ -75,6 +125,7 @@ class XInferenceRerank(Base):
             self.headers["Authorization"] = f"Bearer {key}"
 
     def similarity(self, query: str, texts: list):
+        """计算查询与文本列表的相似度。"""
         if len(texts) == 0:
             return np.array([]), 0
         pairs = [(query, truncate(t, 4096)) for t in texts]
@@ -93,9 +144,21 @@ class XInferenceRerank(Base):
 
 
 class LocalAIRerank(Base):
+    """LocalAI 重排模型封装。
+    
+    使用 LocalAI/LmStudio 本地部署的重排模型。
+    """
     _FACTORY_NAME = "LocalAI"
 
     def __init__(self, key, model_name, base_url):
+        """初始化 LocalAI 重排客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称
+            base_url: LocalAI服务URL
+        """
+        # 确保URL正确
         if base_url.find("/rerank") == -1:
             self.base_url = urljoin(base_url, "/rerank")
         else:
@@ -104,7 +167,10 @@ class LocalAIRerank(Base):
         self.model_name = model_name.split("___")[0]
 
     def similarity(self, query: str, texts: list):
-        # noway to config RAG-MedQA , use fix setting
+        """计算查询与文本列表的相似度。
+        
+        当前项目没有暴露 LocalAI 的细粒度配置，因此使用固定请求参数。
+        """
         texts = [truncate(t, 500) for t in texts]
         data = {
             "model": self.model_name,
@@ -123,19 +189,32 @@ class LocalAIRerank(Base):
         except Exception as _e:
             log_exception(_e, res)
 
+        # 归一化分数
         rank = Base._normalize_rank(rank)
 
         return rank, token_count
 
 
 class NvidiaRerank(Base):
+    """NVIDIA AI API 重排模型封装。
+    
+    使用 NVIDIA AI API 提供的重排服务，支持 nv-rerankqa-mistral-4b 系列模型。
+    """
     _FACTORY_NAME = "NVIDIA"
 
     def __init__(self, key, model_name, base_url="https://ai.api.nvidia.com/v1/retrieval/nvidia/"):
+        """初始化 NVIDIA 重排客户端。
+        
+        Args:
+            key: API密钥
+            model_name: 模型名称
+            base_url: API基础URL
+        """
         if not base_url:
             base_url = "https://ai.api.nvidia.com/v1/retrieval/nvidia/"
         self.model_name = model_name
 
+        # 根据模型名称确定URL
         if self.model_name == "nvidia/nv-rerankqa-mistral-4b-v3":
             self.base_url = urljoin(base_url, "nv-rerankqa-mistral-4b-v3/reranking")
 
@@ -150,6 +229,7 @@ class NvidiaRerank(Base):
         }
 
     def similarity(self, query: str, texts: list):
+        """计算查询与文本列表的相似度。"""
         token_count = num_tokens_from_string(query) + sum([num_tokens_from_string(t) for t in texts])
         data = {
             "model": self.model_name,
@@ -169,12 +249,18 @@ class NvidiaRerank(Base):
 
 
 class LmStudioRerank(Base):
+    """LM-Studio 重排模型封装（预留接口）。
+    
+    目前暂未实现，预留用于未来扩展。
+    """
     _FACTORY_NAME = "LM-Studio"
 
     def __init__(self, key, model_name, base_url, **kwargs):
+        """初始化 LM-Studio 重排客户端。"""
         pass
 
     def similarity(self, query: str, texts: list):
+        """计算查询与文本列表的相似度（暂未实现）。"""
         raise NotImplementedError("The LmStudioRerank has not been implement")
 
 
@@ -191,7 +277,7 @@ class OpenAI_APIRerank(Base):
         self.model_name = model_name.split("___")[0]
 
     def similarity(self, query: str, texts: list):
-        # noway to config RAG-MedQA , use fix setting
+        # 当前项目没有暴露这部分细粒度配置，因此这里使用固定请求参数。
         texts = [truncate(t, 500) for t in texts]
         data = {
             "model": self.model_name,
@@ -221,7 +307,7 @@ class CoHereRerank(Base):
     def __init__(self, key, model_name, base_url=None):
         from cohere import Client
 
-        # Only pass base_url if it's a non-empty string, otherwise use default Cohere API endpoint
+        # 只有在调用方显式传入非空 `base_url` 时，才覆盖 Cohere 默认端点。
         client_kwargs = {"api_key": key}
         if base_url and base_url.strip():
             client_kwargs["base_url"] = base_url
@@ -514,7 +600,7 @@ class RAGconRerank(Base):
         
     
     def similarity(self, query: str, texts: list):
-        # noway to config RAG-MedQA , use fix setting
+        # 当前项目暂时没有把这条配置暴露到外层，因此先使用固定端点。
         texts = [truncate(t, 500) for t in texts]
         data = {
             "model": self.model_name,
