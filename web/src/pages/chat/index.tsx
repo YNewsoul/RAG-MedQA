@@ -2,10 +2,13 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import {
   askStream,
   attachReferences,
+  createDialog,
   createSession,
   getStoredUser,
+  listDialogsMine,
   listSessions,
-  renameSession,
+  renameDialog,
+  type ChatDialog,
   type Message,
   type Session,
 } from '@/services/api';
@@ -29,6 +32,12 @@ function formatTime(ts?: number): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
   return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function buildTitleFromQuestion(question: string, fallback: string): string {
+  const text = question.trim();
+  if (!text) return fallback;
+  return text.length > 20 ? `${text.slice(0, 20)}…` : text;
 }
 
 function UserAvatar({ nickname }: { nickname: string }) {
@@ -75,35 +84,39 @@ function MessageBubble({
   );
 }
 
-// ── SessionView — keyed on sessionId, remounts on switch ─────────────
-
 function SessionView({
+  chat,
   session,
   nickname,
-  onSessionCreated,
-  onSessionUpdated,
+  onDialogUpdated,
 }: {
+  chat: ChatDialog | null;
   session: Session | null;
   nickname: string;
-  onSessionCreated: () => void;
-  onSessionUpdated: () => void;
+  onDialogUpdated: (dialogId: string | null) => Promise<void>;
 }) {
-  const [messages, setMessages] = useState<Message[]>(() => {
-    if (!session) return [];
-    const msgs = attachReferences(session);
-    return msgs.map((m, i) => ({
-      ...m,
-      id: m.id || `srv-${session.id}-${i}`,
-    }));
-  });
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
-  // each send() call gets a unique id; only the latest call's updates are applied
   const sendIdRef = useRef('');
+
+  useEffect(() => {
+    if (!session) {
+      setMessages([]);
+      return;
+    }
+    const msgs = attachReferences(session);
+    setMessages(
+      msgs.map((m, i) => ({
+        ...m,
+        id: m.id || `srv-${session.id}-${i}`,
+      })),
+    );
+  }, [session]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -116,14 +129,17 @@ function SessionView({
     }
   }, [input]);
 
-  async function send(text: string, sid?: string) {
-    const sessionId = sid ?? session?.id;
-    if (!sessionId || !text.trim() || streaming) return;
+  useEffect(() => {
+    return () => abortRef.current?.abort();
+  }, []);
+
+  async function send(text: string, chatId: string, sessionId: string) {
+    if (!text.trim() || streaming) return;
 
     const question = text.trim();
     setInput('');
 
-    const sendId = `${sessionId}-${Date.now()}`;
+    const sendId = `${chatId}-${sessionId}-${Date.now()}`;
     sendIdRef.current = sendId;
 
     const userMsg: Message = {
@@ -154,6 +170,7 @@ function SessionView({
     try {
       for await (const chunk of askStream(
         question,
+        chatId,
         sessionId,
         undefined,
         controller.signal,
@@ -198,28 +215,46 @@ function SessionView({
         ),
       );
       setStreaming(false);
-      onSessionUpdated();
+      await onDialogUpdated(chatId);
     } else {
       setStreaming(false);
     }
   }
 
-  async function startNewChat(question: string) {
-    const sessionName =
-      question.slice(0, 20) + (question.length > 20 ? '…' : '');
-    const newSession = await createSession(sessionName);
+  async function createSessionAndSend(question: string, chatId: string) {
+    const sessionName = buildTitleFromQuestion(question, '新会话');
+    const newSession = await createSession(chatId, sessionName);
     if (!newSession) return;
-    onSessionCreated();
-    await send(question, newSession.id);
+    await send(question, chatId, newSession.id);
+  }
+
+  async function createDialogAndSend(question: string) {
+    const dialogName = buildTitleFromQuestion(question, '新对话');
+    const newDialog = await createDialog(dialogName);
+    if (!newDialog) return;
+
+    const sessionName = buildTitleFromQuestion(question, '新会话');
+    const newSession = await createSession(newDialog.id, sessionName);
+    if (!newSession) return;
+
+    await send(question, newDialog.id, newSession.id);
+  }
+
+  async function sendFromPrompt(question: string) {
+    if (!chat) {
+      await createDialogAndSend(question);
+      return;
+    }
+    if (!session) {
+      await createSessionAndSend(question, chat.id);
+      return;
+    }
+    await send(question, chat.id, session.id);
   }
 
   function handleSend() {
     if (!input.trim() || streaming) return;
-    if (session) {
-      send(input);
-    } else {
-      startNewChat(input);
-    }
+    void sendFromPrompt(input);
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -248,7 +283,7 @@ function SessionView({
             {EXAMPLE_QUESTIONS.map((q) => (
               <button
                 key={q}
-                onClick={() => startNewChat(q)}
+                onClick={() => void sendFromPrompt(q)}
                 className="text-left px-4 py-3 rounded-xl bg-white border border-brand-border text-sm text-brand-ink hover:border-brand-blue/40 hover:bg-brand-blue-light transition shadow-sm"
               >
                 {q}
@@ -328,7 +363,7 @@ function SessionView({
             </button>
           </div>
           <p className="text-center text-xs text-brand-muted/50 mt-2">
-            本平台仅供健康参考，不构成医疗建议，请咨询专业医生
+            本平台仅供健康参考，不构成医疗建议，请咨询专业医生。
           </p>
         </div>
       </div>
@@ -336,15 +371,14 @@ function SessionView({
   );
 }
 
-// ── ChatPage — outer shell (sidebar + keyed SessionView) ────────────
-
 export default function ChatPage() {
   const navigate = useNavigate();
   const user = getStoredUser();
 
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [loadingSessions, setLoadingSessions] = useState(true);
+  const [dialogs, setDialogs] = useState<ChatDialog[]>([]);
+  const [activeDialogId, setActiveDialogId] = useState<string | null>(null);
+  const [activeSession, setActiveSession] = useState<Session | null>(null);
+  const [loadingDialogs, setLoadingDialogs] = useState(true);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameVal, setRenameVal] = useState('');
 
@@ -352,39 +386,86 @@ export default function ChatPage() {
     if (!localStorage.getItem('qh_token')) navigate('/login');
   }, [navigate]);
 
-  const loadSessions = useCallback(async () => {
-    setLoadingSessions(true);
-    const list = await listSessions();
-    setSessions(list);
-    setLoadingSessions(false);
+  const loadDialogSessions = useCallback(async (dialogId: string | null) => {
+    if (!dialogId) {
+      setActiveSession(null);
+      return;
+    }
+    const list = await listSessions(dialogId);
+    setActiveSession(list[0] ?? null);
+  }, []);
+
+  const loadDialogs = useCallback(async (preferredDialogId?: string | null) => {
+    setLoadingDialogs(true);
+    const list = await listDialogsMine();
+    setDialogs(list);
+    setLoadingDialogs(false);
+    setActiveDialogId((prev) => {
+      if (preferredDialogId !== undefined) return preferredDialogId;
+      if (prev && list.some((dialog) => dialog.id === prev)) return prev;
+      return list[0]?.id ?? null;
+    });
   }, []);
 
   useEffect(() => {
-    loadSessions();
-  }, [loadSessions]);
+    void loadDialogs();
+  }, [loadDialogs]);
 
-  const activeSession = activeId
-    ? (sessions.find((s) => s.id === activeId) ?? null)
+  useEffect(() => {
+    let cancelled = false;
+
+    async function run() {
+      if (!activeDialogId) {
+        setActiveSession(null);
+        return;
+      }
+      const list = await listSessions(activeDialogId);
+      if (!cancelled) {
+        setActiveSession(list[0] ?? null);
+      }
+    }
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeDialogId]);
+
+  const refreshDialogState = useCallback(
+    async (dialogId: string | null) => {
+      await loadDialogs(dialogId);
+      await loadDialogSessions(dialogId);
+    },
+    [loadDialogs, loadDialogSessions],
+  );
+
+  const activeDialog = activeDialogId
+    ? (dialogs.find((dialog) => dialog.id === activeDialogId) ?? null)
     : null;
 
-  function handleSelectSession(s: Session) {
-    setActiveId(s.id);
+  function handleSelectDialog(dialog: ChatDialog) {
+    setActiveDialogId(dialog.id);
   }
 
   function handleNewChat() {
-    setActiveId(null);
+    setActiveDialogId(null);
+    setActiveSession(null);
+    setRenamingId(null);
   }
 
-  async function startRename(s: Session) {
-    setRenamingId(s.id);
-    setRenameVal(s.name);
+  function startRename(dialog: ChatDialog) {
+    setRenamingId(dialog.id);
+    setRenameVal(dialog.name);
   }
 
-  async function commitRename(s: Session) {
-    if (renameVal.trim() && renameVal !== s.name) {
-      await renameSession(s.id, renameVal.trim());
-      setSessions((prev) =>
-        prev.map((x) => (x.id === s.id ? { ...x, name: renameVal.trim() } : x)),
+  async function commitRename(dialog: ChatDialog) {
+    const nextName = renameVal.trim();
+    if (nextName && nextName !== dialog.name) {
+      await renameDialog(dialog.id, nextName);
+      setDialogs((prev) =>
+        prev.map((item) =>
+          item.id === dialog.id ? { ...item, name: nextName } : item,
+        ),
       );
     }
     setRenamingId(null);
@@ -395,7 +476,6 @@ export default function ChatPage() {
   return (
     <TooltipProvider>
       <div className="flex h-screen bg-brand-gray overflow-hidden">
-        {/* ── Sidebar ── */}
         <aside className="w-64 bg-white flex flex-col border-r border-brand-border shrink-0">
           <div className="px-4 pt-5 pb-4 border-b border-brand-border">
             <div className="flex items-center gap-2.5">
@@ -429,33 +509,33 @@ export default function ChatPage() {
           </div>
 
           <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
-            {loadingSessions ? (
+            {loadingDialogs ? (
               <div className="text-center text-brand-muted/60 text-xs mt-6">
-                加载中…
+                加载中...
               </div>
-            ) : sessions.length === 0 ? (
+            ) : dialogs.length === 0 ? (
               <div className="text-center text-brand-muted/60 text-xs mt-6">
                 暂无对话记录
               </div>
             ) : (
-              sessions.map((s) => (
+              dialogs.map((dialog) => (
                 <div
-                  key={s.id}
-                  onClick={() => handleSelectSession(s)}
+                  key={dialog.id}
+                  onClick={() => handleSelectDialog(dialog)}
                   className={`group flex items-center gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition ${
-                    activeId === s.id
+                    activeDialogId === dialog.id
                       ? 'bg-brand-blue/10 border border-brand-blue/20'
                       : 'hover:bg-brand-gray/60'
                   }`}
                 >
-                  {renamingId === s.id ? (
+                  {renamingId === dialog.id ? (
                     <input
                       autoFocus
                       value={renameVal}
                       onChange={(e) => setRenameVal(e.target.value)}
-                      onBlur={() => commitRename(s)}
+                      onBlur={() => void commitRename(dialog)}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter') commitRename(s);
+                        if (e.key === 'Enter') void commitRename(dialog);
                         if (e.key === 'Escape') setRenamingId(null);
                         e.stopPropagation();
                       }}
@@ -466,16 +546,16 @@ export default function ChatPage() {
                     <>
                       <div className="flex-1 min-w-0">
                         <div className="text-sm text-brand-ink truncate">
-                          {s.name}
+                          {dialog.name}
                         </div>
                         <div className="text-xs text-brand-muted/60 mt-0.5">
-                          {formatTime(s.update_time)}
+                          {formatTime(dialog.update_time)}
                         </div>
                       </div>
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          startRename(s);
+                          startRename(dialog);
                         }}
                         className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-brand-border transition"
                       >
@@ -518,13 +598,12 @@ export default function ChatPage() {
           </div>
         </aside>
 
-        {/* ── Session view — keyed on activeId for clean remount ── */}
         <SessionView
-          key={activeId ?? '__new__'}
+          key={activeDialogId ?? '__new__'}
+          chat={activeDialog}
           session={activeSession}
           nickname={nickname}
-          onSessionCreated={loadSessions}
-          onSessionUpdated={loadSessions}
+          onDialogUpdated={refreshDialogState}
         />
       </div>
     </TooltipProvider>

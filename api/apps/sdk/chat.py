@@ -39,10 +39,12 @@ import json
 import logging
 from uuid import uuid4
 
+from peewee import fn
 from quart import request, Response
 
 from api.apps import current_user, login_required
 from api.db.db_models import Dialog, Conversation
+from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
 from api.db.services.dialog_service import DialogService
 from api.db.services.conversation_service import ConversationService, async_completion
 from api.utils.api_utils import (
@@ -51,9 +53,21 @@ from api.utils.api_utils import (
     get_request_json,
     server_error_response,
 )
-from common.constants import RetCode, StatusEnum, SYSTEM_TENANT_ID
+from common.constants import LLMType, RetCode, StatusEnum, SYSTEM_TENANT_ID
 from common.misc_utils import get_uuid
 
+
+
+def _model_identifier(model_config):
+    llm_name = model_config.get("llm_name") or model_config.get("model") or ""
+    llm_factory = model_config.get("llm_factory") or model_config.get("factory") or ""
+    if llm_factory and "@" not in llm_name:
+        return f"{llm_name}@{llm_factory}"
+    return llm_name
+
+
+def _is_truthy(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _dialog_to_frontend(d):
@@ -105,6 +119,59 @@ def chats_list():
         keywords = request.args.get("keywords", "")
         chat_id = request.args.get("id")
         name = request.args.get("name")
+        mine_only = _is_truthy(request.args.get("mine", "false"))
+
+        if mine_only:
+            latest_sessions = (
+                Conversation.select(
+                    Conversation.dialog_id,
+                    fn.MAX(Conversation.update_time).alias("latest_session_time"),
+                )
+                .where(Conversation.user_id == current_user.id)
+                .group_by(Conversation.dialog_id)
+                .order_by(fn.MAX(Conversation.update_time).desc())
+            )
+
+            dialog_ids = []
+            latest_session_time_by_dialog_id = {}
+            for row in latest_sessions.dicts():
+                dialog_ids.append(row["dialog_id"])
+                latest_session_time_by_dialog_id[row["dialog_id"]] = row["latest_session_time"]
+
+            dialogs = []
+            total = 0
+            if dialog_ids:
+                query = Dialog.select().where(
+                    Dialog.status == StatusEnum.VALID.value,
+                    Dialog.id.in_(dialog_ids),
+                )
+                if chat_id:
+                    query = query.where(Dialog.id == chat_id)
+                if name:
+                    query = query.where(Dialog.name == name)
+
+                dialog_map = {dialog["id"]: dialog for dialog in query.dicts()}
+                ordered_dialogs = []
+                for dialog_id in dialog_ids:
+                    dialog = dialog_map.get(dialog_id)
+                    if not dialog:
+                        continue
+                    dialog["update_time"] = latest_session_time_by_dialog_id.get(
+                        dialog_id,
+                        dialog.get("update_time"),
+                    )
+                    ordered_dialogs.append(dialog)
+
+                total = len(ordered_dialogs)
+                if page_size > 0:
+                    start = (page - 1) * page_size
+                    end = start + page_size
+                    dialogs = ordered_dialogs[start:end]
+                else:
+                    dialogs = ordered_dialogs
+
+            chats = [_dialog_to_frontend(d) for d in dialogs]
+            return get_json_result(data={"chats": chats, "total": total})
 
         # 调用服务层获取对话列表
         dialogs, total = DialogService.get_list(
@@ -150,8 +217,20 @@ async def chats_create():
         description = req.get("description", "")
         icon = req.get("icon", "")
         dataset_ids = req.get("dataset_ids", [])
-        llm_id = req.get("llm_id", "")
+        llm_id = req.get("llm_id")
+        rerank_id = req.get("rerank_id", "")
         prompt_config = req.get("prompt_config", {})
+
+        if not llm_id:
+            try:
+                llm_id = _model_identifier(get_tenant_default_model_by_type(LLMType.CHAT))
+            except Exception:
+                llm_id = ""
+        if not rerank_id:
+            try:
+                rerank_id = _model_identifier(get_tenant_default_model_by_type(LLMType.RERANK))
+            except Exception:
+                rerank_id = ""
 
         # 生成唯一对话ID
         chat_id = get_uuid()
@@ -163,6 +242,7 @@ async def chats_create():
             "icon": icon,
             "kb_ids": dataset_ids,  # 内部字段名
             "llm_id": llm_id,
+            "rerank_id": rerank_id,
             "status": StatusEnum.VALID.value,  # 状态设为有效
         }
         # 如果提供了提示词配置，则添加到对话中
@@ -354,6 +434,7 @@ def sessions_list(chat_id):
             desc=desc,
             id=session_id,
             name=name,
+            user_id=current_user.id,
         )
         return get_json_result(data=sessions)
     except Exception as e:
@@ -429,7 +510,7 @@ def sessions_get(chat_id, session_id):
     """
     try:
         # 根据ID和所属对话查询会话
-        convs = ConversationService.query(id=session_id, dialog_id=chat_id)
+        convs = ConversationService.query(id=session_id, dialog_id=chat_id, user_id=current_user.id)
         if not convs:
             return get_data_error_result(message="Session not found")
         # 返回第一个匹配的会话
@@ -461,7 +542,7 @@ async def sessions_update(chat_id, session_id):
     """
     try:
         # 检查会话是否存在
-        convs = ConversationService.query(id=session_id, dialog_id=chat_id)
+        convs = ConversationService.query(id=session_id, dialog_id=chat_id, user_id=current_user.id)
         if not convs:
             return get_data_error_result(message="Session not found")
 
@@ -470,7 +551,7 @@ async def sessions_update(chat_id, session_id):
         # 执行更新操作
         ConversationService.update_by_id(session_id, req)
         # 获取更新后的数据
-        convs = ConversationService.query(id=session_id, dialog_id=chat_id)
+        convs = ConversationService.query(id=session_id, dialog_id=chat_id, user_id=current_user.id)
         return get_json_result(data=convs[0].to_dict())
     except Exception as e:
         return server_error_response(e)
@@ -520,6 +601,7 @@ async def chats_ask():
             return get_data_error_result(message="question is required")
         if not chat_id:
             return get_data_error_result(message="chat_id is required")
+        user_id = current_user.id
 
         # 流式响应生成器
         async def generate():
@@ -532,6 +614,7 @@ async def chats_ask():
                 session_id=session_id,
                 stream=stream,
                 kb_ids=kb_ids,
+                user_id=user_id,
             ):
                 # 确保输出为字节流
                 if isinstance(ans, str):

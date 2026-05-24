@@ -77,6 +77,17 @@ export async function logout(): Promise<void> {
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
 
+export interface ChatDialog {
+  id: string;
+  name: string;
+  description?: string;
+  icon?: string;
+  dataset_ids?: string[];
+  llm_id?: string;
+  update_time?: number;
+  create_time?: number;
+}
+
 export interface Session {
   id: string;
   name: string;
@@ -95,36 +106,74 @@ export interface Message {
   reference?: Reference;
 }
 
+export interface DialogListResult {
+  code: number;
+  data: {
+    chats: ChatDialog[];
+    total: number;
+  };
+}
+
 export interface SessionListResult {
   code: number;
   data: Session[];
 }
 
-export async function listSessions(): Promise<Session[]> {
+export async function listDialogsMine(): Promise<ChatDialog[]> {
+  const res = await get<DialogListResult>(
+    '/api/v1/chats?page=1&page_size=100&orderby=update_time&desc=true&mine=true',
+  );
+  return res.code === 0 ? res.data.chats : [];
+}
+
+export async function createDialog(
+  name = '新对话',
+): Promise<ChatDialog | null> {
+  const res = await post<{ code: number; data: ChatDialog }>('/api/v1/chats', {
+    name,
+  });
+  return res.code === 0 ? res.data : null;
+}
+
+export async function renameDialog(
+  dialogId: string,
+  name: string,
+): Promise<void> {
+  await put(`/api/v1/chats/${dialogId}`, { name });
+}
+
+export async function listSessions(chatId: string): Promise<Session[]> {
   const res = await get<SessionListResult>(
-    `/api/v1/chats/${DIALOG_ID}/sessions?page=1&page_size=100&orderby=update_time&desc=true`,
+    `/api/v1/chats/${chatId}/sessions?page=1&page_size=100&orderby=update_time&desc=true`,
   );
   return res.code === 0 ? res.data : [];
 }
 
-export async function createSession(name = '新对话'): Promise<Session | null> {
+export async function createSession(
+  chatId: string,
+  name = '新会话',
+): Promise<Session | null> {
   const res = await post<{ code: number; data: Session }>(
-    `/api/v1/chats/${DIALOG_ID}/sessions`,
+    `/api/v1/chats/${chatId}/sessions`,
     { name },
   );
   return res.code === 0 ? res.data : null;
 }
 
 export async function renameSession(
+  chatId: string,
   sessionId: string,
   name: string,
 ): Promise<void> {
-  await put(`/api/v1/chats/${DIALOG_ID}/sessions/${sessionId}`, { name });
+  await put(`/api/v1/chats/${chatId}/sessions/${sessionId}`, { name });
 }
 
-export async function getSession(sessionId: string): Promise<Session | null> {
+export async function getSession(
+  chatId: string,
+  sessionId: string,
+): Promise<Session | null> {
   const res = await get<{ code: number; data: Session }>(
-    `/api/v1/chats/${DIALOG_ID}/sessions/${sessionId}`,
+    `/api/v1/chats/${chatId}/sessions/${sessionId}`,
   );
   return res.code === 0 ? res.data : null;
 }
@@ -154,6 +203,7 @@ export interface AskChunk {
 
 export async function* askStream(
   question: string,
+  chatId: string,
   sessionId: string,
   onSessionId?: (id: string) => void,
   signal?: AbortSignal,
@@ -163,7 +213,7 @@ export async function* askStream(
     headers: authHeaders(),
     body: JSON.stringify({
       question,
-      dialog_id: DIALOG_ID,
+      dialog_id: chatId,
       session_id: sessionId,
       stream: true,
     }),

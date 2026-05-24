@@ -269,7 +269,10 @@ async def async_completion(chat_id, question, name="New session", session_id=Non
 
     # ==================== 续用现有会话 ====================
     # 查询会话
-    conv = ConversationService.query(id=session_id, dialog_id=chat_id)
+    conv_filters = {"id": session_id, "dialog_id": chat_id}
+    if kwargs.get("user_id"):
+        conv_filters["user_id"] = kwargs["user_id"]
+    conv = ConversationService.query(**conv_filters)
     if not conv:
         raise LookupError("Session does not exist")
     conv = conv[0]
