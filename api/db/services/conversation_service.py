@@ -299,7 +299,7 @@ async def async_completion(chat_id, question, name="New session", session_id=Non
         if m["role"] == "assistant" and not msg:
             continue
         msg.append(m)
-    message_id = msg[-1].get("id")
+    message_id = msg[-1].get("id") # 获取最后一个消息的message_id，用于后续引用
 
     # 获取对话配置
     e, dia = DialogService.get_by_id(conv.dialog_id)

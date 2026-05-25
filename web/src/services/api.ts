@@ -7,6 +7,7 @@ const PUBLIC_KEY =
 export const DIALOG_ID = 'da03725a463a11f1b76c2517003e8f20';
 export const GUEST_TOKEN = 'e599ae72463f11f1b76c2517003e8f20';
 export const GUEST_LIMIT = 3;
+export const DEFAULT_DIALOG_KB_IDS = ['d914b9e657a911f1bb4500e04c897893'];
 
 export function rsaEncrypt(password: string): string {
   const enc = new JSEncrypt();
@@ -128,9 +129,11 @@ export async function listDialogsMine(): Promise<ChatDialog[]> {
 
 export async function createDialog(
   name = '新对话',
+  datasetIds: string[] = DEFAULT_DIALOG_KB_IDS,
 ): Promise<ChatDialog | null> {
   const res = await post<{ code: number; data: ChatDialog }>('/api/v1/chats', {
     name,
+    dataset_ids: datasetIds,
   });
   return res.code === 0 ? res.data : null;
 }
@@ -205,6 +208,7 @@ export async function* askStream(
   question: string,
   chatId: string,
   sessionId: string,
+  kbIds?: string[],
   onSessionId?: (id: string) => void,
   signal?: AbortSignal,
 ): AsyncGenerator<AskChunk> {
@@ -215,6 +219,7 @@ export async function* askStream(
       question,
       dialog_id: chatId,
       session_id: sessionId,
+      kb_ids: kbIds?.length ? kbIds : DEFAULT_DIALOG_KB_IDS,
       stream: true,
     }),
     signal,

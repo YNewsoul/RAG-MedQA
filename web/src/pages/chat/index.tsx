@@ -4,6 +4,7 @@ import {
   attachReferences,
   createDialog,
   createSession,
+  DEFAULT_DIALOG_KB_IDS,
   getStoredUser,
   listDialogsMine,
   listSessions,
@@ -133,7 +134,12 @@ function SessionView({
     return () => abortRef.current?.abort();
   }, []);
 
-  async function send(text: string, chatId: string, sessionId: string) {
+  async function send(
+    text: string,
+    chatId: string,
+    sessionId: string,
+    kbIds?: string[],
+  ) {
     if (!text.trim() || streaming) return;
 
     const question = text.trim();
@@ -172,6 +178,7 @@ function SessionView({
         question,
         chatId,
         sessionId,
+        kbIds,
         undefined,
         controller.signal,
       )) {
@@ -221,23 +228,32 @@ function SessionView({
     }
   }
 
-  async function createSessionAndSend(question: string, chatId: string) {
+  async function createSessionAndSend(
+    question: string,
+    chatId: string,
+    kbIds?: string[],
+  ) {
     const sessionName = buildTitleFromQuestion(question, '新会话');
     const newSession = await createSession(chatId, sessionName);
     if (!newSession) return;
-    await send(question, chatId, newSession.id);
+    await send(question, chatId, newSession.id, kbIds);
   }
 
   async function createDialogAndSend(question: string) {
     const dialogName = buildTitleFromQuestion(question, '新对话');
-    const newDialog = await createDialog(dialogName);
+    const newDialog = await createDialog(dialogName, DEFAULT_DIALOG_KB_IDS);
     if (!newDialog) return;
 
     const sessionName = buildTitleFromQuestion(question, '新会话');
     const newSession = await createSession(newDialog.id, sessionName);
     if (!newSession) return;
 
-    await send(question, newDialog.id, newSession.id);
+    await send(
+      question,
+      newDialog.id,
+      newSession.id,
+      newDialog.dataset_ids ?? DEFAULT_DIALOG_KB_IDS,
+    );
   }
 
   async function sendFromPrompt(question: string) {
@@ -246,10 +262,19 @@ function SessionView({
       return;
     }
     if (!session) {
-      await createSessionAndSend(question, chat.id);
+      await createSessionAndSend(
+        question,
+        chat.id,
+        chat.dataset_ids ?? DEFAULT_DIALOG_KB_IDS,
+      );
       return;
     }
-    await send(question, chat.id, session.id);
+    await send(
+      question,
+      chat.id,
+      session.id,
+      chat.dataset_ids ?? DEFAULT_DIALOG_KB_IDS,
+    );
   }
 
   function handleSend() {

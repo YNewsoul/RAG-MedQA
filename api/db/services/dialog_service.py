@@ -656,11 +656,11 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
 
     # 快速路径：无知识库且无Tavily配置时，直接使用纯LLM对话
-    if not dialog.kb_ids and not dialog.prompt_config.get("tavily_api_key"):
-        logging.debug("No knowledge base and no Tavily configured, using LLM-only chat")
-        async for ans in async_chat_solo(dialog, messages, stream):
-            yield ans
-        return
+    # if not dialog.kb_ids and not dialog.prompt_config.get("tavily_api_key"):
+    #     logging.debug("No knowledge base and no Tavily configured, using LLM-only chat")
+    #     async for ans in async_chat_solo(dialog, messages, stream):
+    #         yield ans
+    #     return
 
     # ==================== 阶段2：模型配置获取与绑定 ====================
     # 记录开始时间（用于性能统计）
@@ -670,7 +670,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
     logging.debug(f"LLM type detected: {llm_type}")
 
-    # 根据类型获取模型配置
+    # 根据类型获取模型配置，包括 模型、url、名称啊啥的
     if llm_type == "image2text":
         llm_model_config = get_model_config_by_type_and_name(LLMType.IMAGE2TEXT, dialog.llm_id)
     else:
@@ -714,9 +714,11 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     image_attachments = []  # chat模型用的图片（data URI格式）
     image_files = []  # image2text模型用的图片（原始格式）
 
+    # 处理消息中的文档ID附件（如果有多个）
     if "doc_ids" in messages[-1]:
         attachments = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
 
+    # 处理消息中的文件附件（如果有多个）
     if "files" in messages[-1]:
         if llm_type == "chat":
             # chat模型：分离文本和图片（data URI格式）

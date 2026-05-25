@@ -239,7 +239,10 @@ plans/
 # 训练/知识库原始数据（体积过大，不入 git）
 data/medical/
 data/.checkpoints/
+data/script/output/
 
 # 离线评测：数据集与跑分结果（依赖本地数据，不提交）
 evaluation/dataset/
 evaluation/results/
+
+conf/local.service_conf.yaml
