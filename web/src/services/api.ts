@@ -7,7 +7,10 @@ const PUBLIC_KEY =
 export const DIALOG_ID = 'da03725a463a11f1b76c2517003e8f20';
 export const GUEST_TOKEN = 'e599ae72463f11f1b76c2517003e8f20';
 export const GUEST_LIMIT = 3;
-export const DEFAULT_DIALOG_KB_IDS = ['d914b9e657a911f1bb4500e04c897893'];
+export const DEFAULT_DIALOG_KB_IDS = [
+  'd914b9e657a911f1bb4500e04c897893',
+  'e329ebd2587a11f18d4700e04c897893',
+];
 
 export function rsaEncrypt(password: string): string {
   const enc = new JSEncrypt();
