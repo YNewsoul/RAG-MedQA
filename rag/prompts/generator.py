@@ -151,50 +151,81 @@ def message_fit_in(msg, max_length=4000):
     Returns:
         tuple[int, list[dict]]: (裁剪后的总 token 数, 裁剪后的消息列表)
     """
-    def count():
-        """计算消息总token数。"""
-        nonlocal msg
-        tks_cnts = []
-        for m in msg:
-            tks_cnts.append({"role": m["role"], "count": num_tokens_from_string(m["content"])})
+    def count(messages=None):
+        """计算消息总 token 数。"""
+        messages = messages if messages is not None else msg
         total = 0
-        for m in tks_cnts:
-            total += m["count"]
+        for m in messages:
+            total += num_tokens_from_string(str(m.get("content", "")))
         return total
 
-    # 第二步：检查是否超限，如果未超限则直接返回
-    if c < max_length:
+    def truncate_message_content(messages, indexes, budget):
+        """按给定预算顺序裁剪若干消息的 content。"""
+        remaining = max(int(budget), 0)
+        for idx in indexes:
+            content = str(messages[idx].get("content", ""))
+            tokens = encoder.encode(content)
+            kept = tokens[:remaining]
+            messages[idx]["content"] = encoder.decode(kept)
+            remaining -= len(kept)
+        return messages
+
+    if not msg:
+        return 0, []
+
+    # 在函数内部工作于浅拷贝消息列表，避免直接修改调用方原始对象。
+    msg = [dict(m) for m in msg]
+
+    # 第一步：检查是否超限，如果未超限则直接返回
+    c = count()
+    if c <= max_length:
         return c, msg
 
-    # 第三步：首次裁剪 - 只保留系统提示和最新一条消息
-    # 系统提示包含重要的指令信息，最新消息是用户当前查询，这两者是最关键的
-    msg_ = [m for m in msg if m["role"] == "system"]  # 提取所有系统提示
-    if len(msg) > 1:
-        msg_.append(msg[-1])  # 添加最新一条消息（通常是用户消息）
-    msg = msg_  # 更新消息列表
-    c = count()  # 重新计算 token 数
-    if c < max_length:
+    # 第二步：首次裁剪 - 只保留系统提示和最新一条消息
+    # 系统提示包含重要的指令信息，最新消息是用户当前查询，这两者是最关键的。
+    system_indexes = [i for i, m in enumerate(msg) if m.get("role") == "system"]
+    keep_indexes = list(system_indexes)
+    latest_index = len(msg) - 1
+    if not keep_indexes or keep_indexes[-1] != latest_index:
+        keep_indexes.append(latest_index)
+    msg = [dict(msg[i]) for i in keep_indexes]
+
+    c = count(msg)
+    if c <= max_length:
         return c, msg
 
-    # 第四步：二次裁剪 - 需要进一步缩减内容
-    ll = num_tokens_from_string(msg_[0]["content"])   # 系统提示的 token 数
-    ll2 = num_tokens_from_string(msg_[-1]["content"]) # 最新消息的 token 数
-    
-    # 判断裁剪策略：如果系统提示占比超过 80%，说明系统提示过长
-    # 优先裁剪系统提示（因为用户查询更重要）
-    if ll / (ll + ll2) > 0.8:
-        # 裁剪系统提示，保留最新消息完整
-        m = msg_[0]["content"]
-        # 使用 encoder 进行精确裁剪，确保不超过剩余 token 限制
-        m = encoder.decode(encoder.encode(m)[: max_length - ll2])
-        msg[0]["content"] = m
-        return max_length, msg
+    # 第三步：二次裁剪 - 需要进一步缩减内容
+    system_indexes = [i for i, m in enumerate(msg) if m.get("role") == "system"]
+    latest_index = len(msg) - 1 if msg else -1
 
-    # 否则裁剪最新消息（保留系统提示完整）
-    m = msg_[-1]["content"]
-    m = encoder.decode(encoder.encode(m)[: max_length - ll2])
-    msg[-1]["content"] = m
-    return max_length, msg
+    system_token_count = sum(
+        num_tokens_from_string(str(msg[i].get("content", ""))) for i in system_indexes
+    )
+    latest_is_system = latest_index in system_indexes
+    latest_token_count = 0
+    if latest_index >= 0 and not latest_is_system:
+        latest_token_count = num_tokens_from_string(str(msg[latest_index].get("content", "")))
+
+    # 只有系统提示时，只能裁系统提示。
+    if latest_is_system:
+        msg = truncate_message_content(msg, system_indexes, max_length)
+        return count(msg), msg
+
+    # 没有系统提示时，只能裁最新消息。
+    if not system_indexes:
+        msg = truncate_message_content(msg, [latest_index], max_length)
+        return count(msg), msg
+
+    total_critical_tokens = system_token_count + latest_token_count
+    system_ratio = system_token_count / total_critical_tokens if total_critical_tokens else 1.0
+
+    # 如果系统提示占比超过 80%，优先裁系统提示；否则裁最新消息。
+    if system_ratio > 0.8:
+        msg = truncate_message_content(msg, system_indexes, max_length - latest_token_count)
+    else:
+        msg = truncate_message_content(msg, [latest_index], max_length - system_token_count)
+
+    return count(msg), msg
 
 
 def kb_prompt(kbinfos, max_tokens, hash_id=False):

@@ -11,6 +11,14 @@ export const DEFAULT_DIALOG_KB_IDS = [
   'd914b9e657a911f1bb4500e04c897893',
   'e329ebd2587a11f18d4700e04c897893',
 ];
+export const DEFAULT_DIALOG_PROMPT_CONFIG = {
+  system:
+    '你是一名严谨的医疗知识库助手。请优先基于以下知识库内容回答用户问题；如果知识库没有足够依据，请明确说明，不要编造结论。\n\n{knowledge}',
+  prologue: "Hi! I'm your assistant. What can I do for you?",
+  parameters: [{ key: 'knowledge', optional: false }],
+  empty_response: '知识库中没有找到相关内容。',
+  quote: true,
+};
 
 export function rsaEncrypt(password: string): string {
   const enc = new JSEncrypt();
@@ -137,6 +145,7 @@ export async function createDialog(
   const res = await post<{ code: number; data: ChatDialog }>('/api/v1/chats', {
     name,
     dataset_ids: datasetIds,
+    prompt_config: DEFAULT_DIALOG_PROMPT_CONFIG,
   });
   return res.code === 0 ? res.data : null;
 }

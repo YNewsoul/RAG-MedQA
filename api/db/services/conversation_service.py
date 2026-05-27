@@ -277,7 +277,7 @@ async def async_completion(chat_id, question, name="New session", session_id=Non
         raise LookupError("Session does not exist")
     conv = conv[0]
 
-    # 构建消息上下文
+    # 构建消息上下文 msg
     msg = []
     question = {
         "content": question,
@@ -306,7 +306,7 @@ async def async_completion(chat_id, question, name="New session", session_id=Non
 
     # 合并知识库ID（对话默认 + 请求传入）
     kb_ids = kwargs.get("kb_ids", [])
-    dia.kb_ids = list(set(dia.kb_ids + kb_ids))
+    dia.kb_ids = list(set(dia.kb_ids + kb_ids)) # 会带上历史对话的知识库
 
     # 初始化引用列表
     if not conv.reference:
